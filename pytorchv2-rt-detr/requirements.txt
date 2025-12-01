@@ -1,0 +1,12 @@
+faster-coco-eval>=1.6.6
+matplotlib
+onnx
+onnxruntime-gpu
+opencv-python
+PyYAML
+pycocotools
+scipy
+tensorboard
+timm
+torch>=2.0.1
+torchvision>=0.15.2

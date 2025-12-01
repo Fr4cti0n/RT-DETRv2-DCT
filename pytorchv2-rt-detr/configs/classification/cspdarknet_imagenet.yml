@@ -1,0 +1,36 @@
+__include__: [
+  ../dataset/imagenet_classification.yml,
+  ../runtime.yml,
+]
+
+model: Classification
+
+Classification:
+  backbone: CSPDarkNet
+  head: ClassHead
+
+CSPDarkNet:
+  width_multi: 1.0
+  depth_multi: 1.0
+  return_idx: [-1]
+  act: silu
+
+ClassHead:
+  hidden_dim: 1024
+  num_classes: 1000
+
+epoches: 100
+
+optimizer:
+  type: SGD
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 0.0001
+  nesterov: false
+
+lr_scheduler:
+  type: CosineAnnealingLR
+  T_max: 100
+  eta_min: 0.0
+
+use_amp: true

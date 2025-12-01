@@ -1,0 +1,32 @@
+__include__: [
+  ../dataset/imagenet_classification.yml,
+  ../runtime.yml,
+]
+
+model: Classification
+
+Classification:
+  backbone: EfficientViTBackbone
+  head: ClassHead
+
+EfficientViTBackbone:
+  variant: m4
+  pretrained: false
+
+ClassHead:
+  hidden_dim: 384
+  num_classes: 1000
+
+epoches: 120
+
+optimizer:
+  type: AdamW
+  lr: 0.001
+  weight_decay: 0.05
+
+lr_scheduler:
+  type: CosineAnnealingLR
+  T_max: 120
+  eta_min: 1.0e-5
+
+use_amp: true

@@ -1,0 +1,37 @@
+__include__: [
+  ../dataset/imagenet_classification.yml,
+  ../runtime.yml,
+]
+
+model: Classification
+
+Classification:
+  backbone: PResNet
+  head: ClassHead
+
+PResNet:
+  depth: 34
+  return_idx: [3]
+  pretrained: false
+  freeze_at: -1
+  freeze_norm: false
+
+ClassHead:
+  hidden_dim: 512
+  num_classes: 1000
+
+epoches: 90
+
+optimizer:
+  type: SGD
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 0.0001
+  nesterov: false
+
+lr_scheduler:
+  type: CosineAnnealingLR
+  T_max: 90
+  eta_min: 0.0
+
+use_amp: true
