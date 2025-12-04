@@ -81,6 +81,10 @@ def parse_args() -> argparse.Namespace:
                         help="Limit number of training samples for quick sanity checks.")
     parser.add_argument("--max-val-images", type=int, default=None,
                         help="Limit number of validation samples for quick sanity checks.")
+    parser.add_argument("--preview-sample", action="store_true",
+                        help="Decode and save a reconstruction preview before training (batch size 1 recommended).")
+    parser.add_argument("--preview-output", type=Path, default=None,
+                        help="Optional filepath for the reconstruction preview image.")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging (requires wandb package).")
     parser.add_argument("--wandb-project", default="rtdetr-compressed",
@@ -139,6 +143,90 @@ def build_dataloaders(
         pin_memory=True,
     )
     return train_loader, val_loader
+
+
+def preview_reconstruction_sample(
+    backbone: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    save_path: Path,
+) -> None:
+    try:
+        batch = next(iter(loader))
+    except StopIteration:
+        print("[preview] Training dataset is empty; skipping reconstruction preview.")
+        return
+
+    inputs, _ = batch
+    if not isinstance(inputs, (list, tuple)) or len(inputs) != 2:
+        print("[preview] Unexpected payload structure; reconstruction preview is only supported for DCT inputs.")
+        return
+
+    y_blocks, cbcr_blocks = inputs
+    if y_blocks.dim() != 4 or cbcr_blocks.dim() != 5:
+        print("[preview] Unexpected coefficient tensor shape; skipping reconstruction preview.")
+        return
+
+    y_blocks = y_blocks.to(device=device, dtype=torch.float32)
+    cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
+
+    backbone = backbone.to(device)
+    backbone.eval()
+    with torch.no_grad():
+        try:
+            y_plane, cb_plane, cr_plane = backbone._decode_planes(y_blocks, cbcr_blocks)  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            print(f"[preview] Failed to decode DCT payload: {exc}")
+            return
+        rgb = backbone._ycbcr_to_rgb(y_plane, cb_plane, cr_plane)  # type: ignore[attr-defined]
+        refined = backbone.refine(rgb)  # type: ignore[attr-defined]
+
+    rgb_cpu = rgb[0].detach().cpu().clamp(0.0, 1.0)
+    refined_cpu = refined[0].detach().cpu()
+    refined_clamped = refined_cpu.clamp(0.0, 1.0)
+    diff = (refined_cpu - rgb_cpu).abs().mean(dim=0)
+    diff_max = float(diff.max().item() if diff.numel() > 0 else 0.0)
+    if diff_max > 0.0:
+        diff_vis = (diff / diff_max).clamp(0.0, 1.0)
+    else:
+        diff_vis = diff
+
+    # Lazy import so matplotlib is only required when previewing.
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(rgb_cpu.permute(1, 2, 0).numpy())
+    axes[0].set_title("Decoded RGB (pre-refine)")
+    axes[1].imshow(refined_clamped.permute(1, 2, 0).numpy())
+    axes[1].set_title("Refine Output (clamped)")
+    axes[2].imshow(diff_vis.numpy(), cmap="magma")
+    axes[2].set_title("|Refine - Decoded| (mean)")
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"[preview] Saved reconstruction preview to {save_path}")
+    print(
+        "[preview] decoded_rgb: min={:.4f} max={:.4f} mean={:.4f}".format(
+            float(rgb_cpu.min()), float(rgb_cpu.max()), float(rgb_cpu.mean())
+        )
+    )
+    print(
+        "[preview] refined   : min={:.4f} max={:.4f} mean={:.4f}".format(
+            float(refined_cpu.min()), float(refined_cpu.max()), float(refined_cpu.mean())
+        )
+    )
+    print(
+        "[preview] |refined-decoded| mean={:.4f} max={:.4f}".format(
+            float(diff.mean().item()), diff_max
+        )
+    )
 
 
 def train_one_epoch(
@@ -271,10 +359,15 @@ def main() -> None:
     normalizer_train: T.Transform | None = None
     normalizer_val: T.Transform | None = None
     stats_path_input: Path | None = args.dct_stats
-    if stats_path_input is None:
-        default_stats = Path("configs/dct_stats") / f"imagenet_coeff{args.coeff_window}_{args.range_mode}.pt"
-        if default_stats.exists():
-            stats_path_input = default_stats
+    if args.variant == "reconstruction":
+        if stats_path_input is not None:
+            print("Reconstruction variant ignores --dct-stats; proceeding without coefficient normalisation.")
+        stats_path_input = None
+    else:
+        if stats_path_input is None:
+            default_stats = Path("configs/dct_stats") / f"imagenet_coeff{args.coeff_window}_{args.range_mode}.pt"
+            if default_stats.exists():
+                stats_path_input = default_stats
     stats_path_resolved: Path | None = None
     if stats_path_input is not None:
         try:
@@ -425,6 +518,18 @@ def main() -> None:
             return
 
     run_start_time = time.time()
+
+    if args.preview_sample:
+        if args.variant != "reconstruction":
+            print("[preview] Reconstruction preview currently supports only the reconstruction variant.")
+        else:
+            preview_path = args.preview_output or (output_dir / "preview_reconstruction.png")
+            preview_reconstruction_sample(model.backbone, train_loader, device, preview_path)
+        if args.epochs <= 0:
+            print("Preview complete and epochs<=0; exiting without training.")
+            if wandb_run is not None:
+                wandb_run.finish()
+            return
 
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"Epoch {epoch}/{args.epochs}")
