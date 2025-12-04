@@ -1,0 +1,124 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            jlvpb6u0po71mp27scccudsh1q0b1dsj:
+                args:
+                    - --train-dirs
+                    - dataset/classification/imagenet1k0
+                    - dataset/classification/imagenet1k1
+                    - dataset/classification/imagenet1k2
+                    - dataset/classification/imagenet1k3
+                    - --val-dir
+                    - dataset/classification/imagenet1kvalid
+                    - --epochs
+                    - "3"
+                    - --batch-size
+                    - "128"
+                    - --workers
+                    - "2"
+                    - --max-train-images
+                    - "100000"
+                    - --max-val-images
+                    - "50000"
+                    - --coeff-window
+                    - "4"
+                    - --range-mode
+                    - studio
+                    - --variant
+                    - luma-fusion-pruned
+                    - --output-dir
+                    - output/test_wandb
+                    - --wandb
+                    - --wandb-project
+                    - rtdetr-compressed
+                cpu_count: 20
+                cpu_count_logical: 28
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "2001449418752"
+                        used: "1653325316096"
+                email: firegunneur@outlook.fr
+                executable: /home/aduche/Bureau/motion_sight_back_up/R-Yolov1/yolo-v3/Machine-Learning-Collection/ML/Pytorch/object_detection/RT-DETRv2-DCT/pytorchv2-rt-detr/detr-compressed/bin/python
+                git:
+                    commit: 16cffb142e090553d9ce33e7513e51d677add8fa
+                    remote: git@github.com:Fr4cti0n/RT-DETRv2-DCT.git
+                gpu: NVIDIA RTX 5000 Ada Generation Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 9728
+                      memoryTotal: "17171480576"
+                      name: NVIDIA RTX 5000 Ada Generation Laptop GPU
+                      uuid: GPU-42c26b1f-c43d-d031-348c-5cdb63e3a0c9
+                host: PO-GSSZR34
+                memory:
+                    total: "67092221952"
+                os: Linux-6.8.0-87-generic-x86_64-with-glibc2.35
+                program: -m src.nn.backbone.train_compressed_backbones
+                python: CPython 3.13.5
+                root: /home/aduche/Bureau/motion_sight_back_up/R-Yolov1/yolo-v3/Machine-Learning-Collection/ML/Pytorch/object_detection/RT-DETRv2-DCT/pytorchv2-rt-detr
+                startedAt: "2025-12-01T13:04:42.752731Z"
+                writerId: jlvpb6u0po71mp27scccudsh1q0b1dsj
+        m: []
+        python_version: 3.13.5
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 63
+            "2":
+                - 1
+                - 41
+                - 49
+                - 63
+            "3":
+                - 16
+                - 62
+            "4": 3.13.5
+            "5": 0.23.0
+            "12": 0.23.0
+            "13": linux-x86_64
+batch_size:
+    value: 128
+channels_last:
+    value: false
+coeff_window:
+    value: 4
+epochs:
+    value: 3
+gamma:
+    value: 0.1
+image_size:
+    value: 224
+lr:
+    value: 0.1
+milestones:
+    value:
+        - 30
+        - 60
+        - 80
+momentum:
+    value: 0.9
+range_mode:
+    value: studio
+seed:
+    value: 1337
+train_dirs:
+    value:
+        - dataset/classification/imagenet1k0
+        - dataset/classification/imagenet1k1
+        - dataset/classification/imagenet1k2
+        - dataset/classification/imagenet1k3
+train_samples:
+    value: 100000
+val_dir:
+    value: dataset/classification/imagenet1kvalid
+val_samples:
+    value: 50000
+variant:
+    value: luma-fusion-pruned
+weight_decay:
+    value: 0.0001

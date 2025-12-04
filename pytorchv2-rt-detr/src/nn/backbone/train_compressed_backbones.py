@@ -10,11 +10,13 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
+from torchvision.transforms import v2 as T
 
 from ...data.dataset.imagenet import ImageNetDataset
 from ...data.dataset.subset import limit_total
+from ...data.transforms.dct_normalize import NormalizeDCTCoefficients
 from ..arch.classification import ClassHead
 from .compressed_presnet import build_compressed_backbone
 from .train_backbones import (
@@ -26,8 +28,13 @@ from .train_backbones import (
     kaiming_initialisation,
     normalise_logits,
 )
-
+try:
+    import wandb  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
 _NUM_CLASSES = 1000
+_LR_REFERENCE_BATCH = 256
+_LR_CAP = 0.4
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,11 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=90)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=0.025)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--milestones", type=int, nargs="*", default=[30, 60, 80])
-    parser.add_argument("--gamma", type=float, default=0.1)
+    parser.add_argument("--eta-min", type=float, default=0.0,
+                        help="Minimum learning rate for cosine annealing schedule.")
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Number of linear warmup epochs applied before cosine decay.")
     parser.add_argument("--coeff-window", type=int, choices=[1, 2, 4, 8], default=4)
     parser.add_argument("--range-mode", choices=["studio", "full"], default="studio")
     parser.add_argument(
@@ -53,12 +62,18 @@ def parse_args() -> argparse.Namespace:
         default="reconstruction",
         help="Compressed backbone adapter to employ.",
     )
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--save-best", action="store_true")
+    parser.add_argument("--save-last", action=argparse.BooleanOptionalAction, default=True,
+                        help="Persist checkpoint_last.pth each epoch (use --no-save-last to disable).")
+    parser.add_argument("--checkpoint-dir", type=Path, default=None,
+                        help="Optional directory dedicated to checkpoints (defaults to output dir).")
+    parser.add_argument("--auto-resume", action="store_true",
+                        help="Resume automatically from checkpoint_dir/checkpoint_last.pth when available.")
     parser.add_argument("--show-progress", action="store_true")
     parser.add_argument("--device", default=None, help="Optional explicit device string, e.g. cuda:0")
     parser.add_argument("--print-freq", type=int, default=50, help="Steps between training log lines.")
@@ -66,6 +81,20 @@ def parse_args() -> argparse.Namespace:
                         help="Limit number of training samples for quick sanity checks.")
     parser.add_argument("--max-val-images", type=int, default=None,
                         help="Limit number of validation samples for quick sanity checks.")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging (requires wandb package).")
+    parser.add_argument("--wandb-project", default="rtdetr-compressed",
+                        help="Weights & Biases project name.")
+    parser.add_argument("--wandb-entity", default=None,
+                        help="Optional Weights & Biases entity/team.")
+    parser.add_argument("--wandb-run-name", default=None,
+                        help="Optional run name shown in the Weights & Biases UI.")
+    parser.add_argument("--wandb-tags", nargs="*", default=None,
+                        help="Optional list of tags for the Weights & Biases run.")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="Path to a checkpoint to resume training from.")
+    parser.add_argument("--dct-stats", type=Path, default=None,
+                        help="Optional path to a .pt file with per-coefficient DCT statistics for normalisation.")
     return parser.parse_args()
 
 
@@ -79,8 +108,15 @@ def build_dataloaders(
     show_progress: bool,
     max_train: int | None,
     max_val: int | None,
+    dct_normalizer_train: T.Transform | None = None,
+    dct_normalizer_val: T.Transform | None = None,
 ) -> tuple[DataLoader, DataLoader]:
-    train_tf, val_tf = build_resnet_transforms(image_size, compression=compression_cfg)
+    train_tf, val_tf = build_resnet_transforms(
+        image_size,
+        compression=compression_cfg,
+        dct_normalizer_train=dct_normalizer_train,
+        dct_normalizer_val=dct_normalizer_val,
+    )
     train_set = ImageNetDataset(train_dirs, transforms=train_tf, show_progress=show_progress)
     val_set = ImageNetDataset([val_dir], transforms=val_tf, show_progress=show_progress)
     if max_train is not None:
@@ -112,15 +148,19 @@ def train_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     epoch: int,
+    total_epochs: int,
+    run_start_time: float,
     use_amp: bool,
     scaler: torch.cuda.amp.GradScaler | None,
     print_freq: int = 50,
 ) -> dict[str, float]:
     model.train()
     running_loss = 0.0
-    correct = 0
+    correct1 = 0
+    correct5 = 0
     total = 0
     last_log = time.time()
+    epoch_start_time = time.time()
     for step, (inputs, targets) in enumerate(loader):
         inputs = _move_to_device(inputs, device)
         targets = targets.to(device)
@@ -139,27 +179,55 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
         running_loss += loss.item() * targets.size(0)
-        correct += outputs.argmax(dim=1).eq(targets).sum().item()
         total += targets.size(0)
+
+        maxk = min(5, outputs.size(1))
+        _, pred = outputs.topk(maxk, dim=1, largest=True, sorted=True)
+        pred = pred.t()
+        correct_matrix = pred.eq(targets.view(1, -1).expand_as(pred))
+        correct1 += correct_matrix[:1].reshape(-1).float().sum().item()
+        correct5 += correct_matrix[:5].reshape(-1).float().sum().item()
         if (step + 1) % print_freq == 0 or (step + 1) == len(loader):
             avg_loss = running_loss / max(total, 1)
-            acc = 100.0 * correct / max(total, 1)
+            acc1 = correct1 / max(total, 1)
+            acc5 = correct5 / max(total, 1)
             now = time.time()
-            print(
+            step_time = now - last_log
+            elapsed = now - epoch_start_time
+            progress = (step + 1) / len(loader)
+            remaining_epoch = (elapsed / max(progress, 1e-6)) - elapsed
+            lr = optimizer.param_groups[0]["lr"]
+            gpu_mem = None
+            if device.type == "cuda":
+                gpu_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            global_elapsed = now - run_start_time
+            steps_per_epoch = len(loader)
+            total_steps = total_epochs * steps_per_epoch
+            completed_steps = (epoch - 1) * steps_per_epoch + (step + 1)
+            progress_total = completed_steps / max(total_steps, 1)
+            remaining_total = (global_elapsed / max(progress_total, 1e-6)) - global_elapsed
+            msg = (
                 f"  epoch {epoch:03d} step {step+1:04}/{len(loader)} | "
-                f"loss={avg_loss:.4f} acc@1={acc:.2f}% time={now - last_log:.1f}s"
+                f"loss={avg_loss:.4f} acc@1={acc1:.4f} acc@5={acc5:.4f} "
+                f"lr={lr:.5f} step={step_time:.1f}s "
+                f"eta_epoch={remaining_epoch/60:.1f}m eta_total={remaining_total/3600:.2f}h"
             )
+            if gpu_mem is not None:
+                msg += f" gpu={gpu_mem:.1f}MB"
+            print(msg)
             last_log = now
     return {
         "loss": running_loss / max(total, 1),
-        "acc1": 100.0 * correct / max(total, 1),
+        "acc1": correct1 / max(total, 1),
+        "acc5": correct5 / max(total, 1),
     }
 
 
 def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> dict[str, float]:
     model.eval()
     running_loss = 0.0
-    correct = 0
+    correct1 = 0
+    correct5 = 0
     total = 0
     with torch.no_grad():
         for inputs, targets in loader:
@@ -168,11 +236,17 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
             outputs = normalise_logits(model(inputs))
             loss = criterion(outputs, targets)
             running_loss += loss.item() * targets.size(0)
-            correct += outputs.argmax(dim=1).eq(targets).sum().item()
+            maxk = min(5, outputs.size(1))
+            _, pred = outputs.topk(maxk, dim=1, largest=True, sorted=True)
+            pred = pred.t()
+            correct_matrix = pred.eq(targets.view(1, -1).expand_as(pred))
+            correct1 += correct_matrix[:1].reshape(-1).float().sum().item()
+            correct5 += correct_matrix[:5].reshape(-1).float().sum().item()
             total += targets.size(0)
     return {
         "loss": running_loss / max(total, 1),
-        "acc1": 100.0 * correct / max(total, 1),
+        "acc1": correct1 / max(total, 1),
+        "acc5": correct5 / max(total, 1),
     }
 
 
@@ -180,6 +254,7 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    wandb_run = None
 
     if args.device is not None:
         device = torch.device(args.device)
@@ -193,6 +268,32 @@ def main() -> None:
         "keep_original": False,
     }
 
+    normalizer_train: T.Transform | None = None
+    normalizer_val: T.Transform | None = None
+    stats_path_input: Path | None = args.dct_stats
+    if stats_path_input is None:
+        default_stats = Path("configs/dct_stats") / f"imagenet_coeff{args.coeff_window}_{args.range_mode}.pt"
+        if default_stats.exists():
+            stats_path_input = default_stats
+    stats_path_resolved: Path | None = None
+    if stats_path_input is not None:
+        try:
+            stats_path_resolved = stats_path_input.expanduser().resolve()
+            normalizer_train = NormalizeDCTCoefficients.from_file(
+                stats_path_resolved,
+                coeff_window=args.coeff_window,
+            )
+            normalizer_val = NormalizeDCTCoefficients.from_file(
+                stats_path_resolved,
+                coeff_window=args.coeff_window,
+            )
+            print(f"Loaded DCT coefficient statistics from {stats_path_resolved}")
+        except Exception as exc:  # pragma: no cover - safeguard for user-provided files
+            print(f"Failed to load DCT stats from {stats_path_input}: {exc}")
+            stats_path_resolved = None
+    if stats_path_resolved is None:
+        print("Proceeding without DCT coefficient normalisation.")
+
     train_loader, val_loader = build_dataloaders(
         [str(Path(p)) for p in args.train_dirs],
         str(Path(args.val_dir)),
@@ -203,7 +304,60 @@ def main() -> None:
         args.show_progress,
         args.max_train_images,
         args.max_val_images,
+        normalizer_train,
+        normalizer_val,
     )
+
+    effective_lr = args.lr * args.batch_size / _LR_REFERENCE_BATCH
+    if effective_lr > _LR_CAP:
+        effective_lr = _LR_CAP
+    if effective_lr != args.lr:
+        print(
+            f"Adjusted learning rate from {args.lr:.5f} (base) to {effective_lr:.5f} "
+            f"for batch size {args.batch_size} (cap={_LR_CAP:.5f})."
+        )
+    warmup_epochs = max(0, args.warmup_epochs)
+    cosine_duration = max(1, args.epochs - warmup_epochs)
+    if warmup_epochs > 0:
+        print(f"Applying {warmup_epochs} warmup epoch(s) before cosine decay.")
+
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError(
+                "Weights & Biases is not installed. Run 'pip install wandb' to enable logging."
+            )
+        wandb_config = {
+            "variant": args.variant,
+            "coeff_window": args.coeff_window,
+            "range_mode": args.range_mode,
+            "image_size": args.image_size,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "lr_effective": effective_lr,
+            "lr_reference_batch": _LR_REFERENCE_BATCH,
+            "lr_cap": _LR_CAP,
+            "warmup_epochs": warmup_epochs,
+            "momentum": args.momentum,
+            "weight_decay": args.weight_decay,
+            "eta_min": args.eta_min,
+            "train_samples": len(train_loader.dataset),
+            "val_samples": len(val_loader.dataset),
+            "seed": args.seed,
+            "train_dirs": [str(p) for p in args.train_dirs],
+            "val_dir": str(args.val_dir),
+            "channels_last": args.channels_last,
+            "dct_stats_path": str(stats_path_resolved) if stats_path_resolved is not None else None,
+        }
+        default_name = f"{args.variant}_{args.coeff_window}"
+        run_name = args.wandb_run_name or default_name
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=run_name,
+            tags=args.wandb_tags,
+            config=wandb_config,
+        )
 
     model, _ = build_model("resnet34", _NUM_CLASSES)
     model.apply(kaiming_initialisation)
@@ -225,20 +379,67 @@ def main() -> None:
 
     optimizer = torch.optim.SGD(
         model.parameters(),
-        lr=args.lr,
+        lr=effective_lr,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
-    scheduler = MultiStepLR(optimizer, milestones=args.milestones, gamma=args.gamma)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cosine_duration, eta_min=args.eta_min)
     criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = args.checkpoint_dir or output_dir
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_acc = 0.0
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    resume_path: Path | None = None
+    if args.resume is not None:
+        resume_path = args.resume
+    elif args.auto_resume:
+        candidate = checkpoint_dir / "checkpoint_last.pth"
+        if candidate.exists():
+            resume_path = candidate
+    if resume_path is not None:
+        if resume_path.is_dir():
+            resume_path = resume_path / "checkpoint_last.pth"
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        if scaler is not None and checkpoint.get("scaler") is not None:
+            scaler.load_state_dict(checkpoint["scaler"])
+        best_acc = float(checkpoint.get("best_acc", 0.0))
+        last_epoch = int(checkpoint.get("epoch", 0))
+        start_epoch = last_epoch + 1
+        print(f"Resumed training from epoch {last_epoch} with best acc@1={best_acc:.4f} ({resume_path})")
+        if start_epoch > args.epochs:
+            print("Checkpoint epoch exceeds requested total epochs; nothing to train.")
+            if wandb_run is not None:
+                wandb_run.finish()
+            return
+
+    run_start_time = time.time()
+
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f"Epoch {epoch}/{args.epochs}")
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        warmup_active = False
+        warmup_factor = 1.0
+        if warmup_epochs > 0:
+            warmup_idx = epoch - 1
+            if warmup_idx < warmup_epochs:
+                warmup_active = True
+                warmup_factor = (warmup_idx + 1) / warmup_epochs
+                warmup_lr = effective_lr * warmup_factor
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = warmup_lr
         stats = train_one_epoch(
             model,
             train_loader,
@@ -246,19 +447,48 @@ def main() -> None:
             criterion,
             device,
             epoch,
+            args.epochs,
+            run_start_time,
             use_amp=args.amp,
             scaler=scaler,
             print_freq=args.print_freq,
         )
         val_stats = evaluate(model, val_loader, criterion, device)
-        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        if not warmup_active:
+            scheduler.step()
+        next_lr = optimizer.param_groups[0]["lr"]
         acc1 = val_stats["acc1"]
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            gpu_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        else:
+            gpu_mem = None
         print(
-            f"  train loss={stats['loss']:.4f} acc@1={stats['acc1']:.2f}% | "
-            f"val loss={val_stats['loss']:.4f} acc@1={val_stats['acc1']:.2f}%"
+            f"  train loss={stats['loss']:.4f} acc@1={stats['acc1']:.4f} acc@5={stats['acc5']:.4f} | "
+            f"val loss={val_stats['loss']:.4f} acc@1={val_stats['acc1']:.4f} acc@5={val_stats['acc5']:.4f}"
+            + (f" gpu_mem={gpu_mem:.1f}MB" if gpu_mem is not None else "")
         )
+        if wandb_run is not None:
+            wandb.log({
+                "epoch": epoch,
+                "train/loss": stats["loss"],
+                "train/acc1": stats["acc1"],
+                "train/acc5": stats["acc5"],
+                "val/loss": val_stats["loss"],
+                "val/acc1": val_stats["acc1"],
+                "val/acc5": val_stats["acc5"],
+                "lr": current_lr,
+                "lr_next": next_lr,
+                "warmup_factor": warmup_factor,
+                **({"gpu/peak_mem_mb": gpu_mem} if gpu_mem is not None else {}),
+            })
         if acc1 > best_acc:
             best_acc = acc1
+            if wandb_run is not None:
+                wandb_run.summary["best/acc1"] = best_acc
+                wandb_run.summary["best/acc5"] = val_stats["acc5"]
+                wandb_run.summary["best/epoch"] = epoch
             if args.save_best:
                 torch.save(
                     {
@@ -266,14 +496,30 @@ def main() -> None:
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict() if scaler is not None else None,
                         "variant": args.variant,
                         "coeff_window": args.coeff_window,
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
                     },
-                    output_dir / "model_best.pth",
+                    checkpoint_dir / "model_best.pth",
                 )
-                print(f"  Saved new best checkpoint acc@1={best_acc:.2f}%")
+                print(f"  Saved new best checkpoint acc@1={best_acc:.4f}")
+        if args.save_last:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict() if scaler is not None else None,
+                    "variant": args.variant,
+                    "coeff_window": args.coeff_window,
+                    "range_mode": args.range_mode,
+                    "best_acc": best_acc,
+                },
+                checkpoint_dir / "checkpoint_last.pth",
+            )
         if args.save_every and epoch % args.save_every == 0:
             torch.save(
                 {
@@ -281,15 +527,18 @@ def main() -> None:
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict() if scaler is not None else None,
                     "variant": args.variant,
                     "coeff_window": args.coeff_window,
                     "range_mode": args.range_mode,
                     "best_acc": best_acc,
                 },
-                output_dir / f"checkpoint_{epoch:04d}.pth",
+                checkpoint_dir / f"checkpoint_{epoch:04d}.pth",
             )
 
-    print(f"Training complete. Best val acc@1={best_acc:.2f}%")
+    print(f"Training complete. Best val acc@1={best_acc:.4f}")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

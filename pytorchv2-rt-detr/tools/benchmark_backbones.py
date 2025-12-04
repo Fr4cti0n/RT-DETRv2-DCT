@@ -35,15 +35,16 @@ def parse_args() -> argparse.Namespace:
         "--sizes",
         type=int,
         nargs="+",
-        default=[640],
-        help="Spatial resolutions (multiples of 8) to benchmark. Default uses the RT-DETR input size (640).",
+        default=[256],
+        help="Spatial resolutions (multiples of 8) to benchmark. Default uses 256x256.",
     )
     parser.add_argument(
-        "--coeff-window",
+        "--coeff-windows",
         type=int,
-        default=8,
+        nargs="+",
+        default=[8],
         choices=[1, 2, 4, 8],
-        help="Low-frequency window used for compressed variants.",
+        help="Low-frequency window(s) used for compressed variants.",
     )
     parser.add_argument(
         "--range-mode",
@@ -81,7 +82,7 @@ def _ensure_multiple_of(values: Iterable[int], divisor: int = 8) -> List[int]:
     return cleaned
 
 
-def _build_model(variant: str, range_mode: str, coeff_window: int) -> torch.nn.Module:
+def _build_model(variant: str, range_mode: str, coeff_window: int | None) -> torch.nn.Module:
     model, _ = build_model("resnet34", num_classes=1000)
     if variant == "rgb-standard":
         return model
@@ -92,7 +93,7 @@ def _build_model(variant: str, range_mode: str, coeff_window: int) -> torch.nn.M
         range_mode=range_mode,
         mean=_IMAGENET_MEAN,
         std=_IMAGENET_STD,
-        coeff_window=coeff_window,
+        coeff_window=coeff_window or 8,
     )
     if compressed_variant == "luma-fusion-pruned":
         hidden_dim = model.backbone.out_channels[0]
@@ -104,12 +105,12 @@ def _make_input(
     variant: str,
     size: int,
     device: torch.device,
-    coeff_window: int,
-    range_mode: str,
-    compressor: CompressToDCT,
+    compressor: CompressToDCT | None,
 ) -> Sequence[torch.Tensor] | torch.Tensor:
     if variant == "rgb-standard":
         return torch.rand(1, 3, size, size, device=device)
+    if compressor is None:
+        raise RuntimeError("Compressor is required for compressed variants.")
     rgb = torch.rand(3, size, size)
     y_blocks, cbcr_blocks = compressor(rgb)
     return (
@@ -165,31 +166,39 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     sizes = _ensure_multiple_of(args.sizes)
+    coeff_windows = sorted(_ensure_multiple_of(args.coeff_windows, divisor=1))
     torch.manual_seed(args.seed)
-
-    compressor = CompressToDCT(
-        coeff_window=args.coeff_window,
-        range_mode=args.range_mode,
-        dtype=torch.float32,
-        keep_original=False,
-    )
 
     results = []
     for variant in args.variants:
-        model = _build_model(variant, args.range_mode, args.coeff_window).to(device)
-        model.eval()
+        window_list: List[int | None]
+        if variant == "rgb-standard":
+            window_list = [None]
+        else:
+            window_list = coeff_windows
 
-        params_m = sum(p.numel() for p in model.parameters()) / 1e6
+        for coeff_window in window_list:
+            model = _build_model(variant, args.range_mode, coeff_window).to(device)
+            model.eval()
 
-        for size in sizes:
-            sample = _make_input(
-                variant,
-                size,
-                device,
-                args.coeff_window,
-                args.range_mode,
-                compressor,
-            )
+            params_m = sum(p.numel() for p in model.parameters()) / 1e6
+
+            compressor = None
+            if coeff_window is not None:
+                compressor = CompressToDCT(
+                    coeff_window=coeff_window,
+                    range_mode=args.range_mode,
+                    dtype=torch.float32,
+                    keep_original=False,
+                )
+
+            for size in sizes:
+                sample = _make_input(
+                    variant,
+                    size,
+                    device,
+                    compressor,
+                )
             gflops = None
             if FlopCountAnalysis is not None:
                 try:
@@ -200,12 +209,15 @@ def main() -> None:
             peak_mem = None
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.reset_peak_memory_stats(device)
+
             out_desc = _collect_stage_shapes(model, sample)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
                 peak_bytes = torch.cuda.max_memory_allocated(device)
                 peak_mem = peak_bytes / (1024 ** 2)
-            results.append((variant, size, params_m, gflops, out_desc, peak_mem))
+            label = variant if coeff_window is None else f"{variant}@cw={coeff_window}"
+            results.append((label, size, params_m, gflops, out_desc, peak_mem))
 
     header = ["Model", "Input", "Params (M)", "GFLOPs", "Out Shapes", "Peak Mem (MB)"]
     rows = [header]

@@ -84,14 +84,24 @@ class _BackboneAdapter(nn.Module):
         conv1 = list(backbone.conv1.children())[-1]
         self.target_channels = conv1.norm.num_features if hasattr(conv1, "norm") else 64
 
-    def _forward_residual_stages(self, conv1_out: torch.Tensor):
-        x = F.max_pool2d(conv1_out, kernel_size=3, stride=2, padding=1)
+    def _forward_residual_stages(self, conv1_out: torch.Tensor, *, skip_pool: bool = False):
+        if skip_pool:
+            x = conv1_out
+        else:
+            x = F.max_pool2d(conv1_out, kernel_size=3, stride=2, padding=1)
         outs = []
         for idx, stage in enumerate(self.backbone.res_layers):
             x = stage(x)
             if idx in self.return_idx:
                 outs.append(x)
         return outs
+
+
+def _build_active_index(coeff_window: int) -> torch.Tensor | None:
+    if coeff_window >= 8:
+        return None
+    indices = [row + col * 8 for col in range(coeff_window) for row in range(coeff_window)]
+    return torch.tensor(indices, dtype=torch.long)
 
 
 class CompressedResNetReconstruction(_BackboneAdapter):
@@ -162,16 +172,26 @@ class CompressedResNetReconstruction(_BackboneAdapter):
 
 
 class CompressedResNetBlockStem(_BackboneAdapter):
-    def __init__(self, backbone: PResNet) -> None:
+    def __init__(self, backbone: PResNet, coeff_window: int) -> None:
         super().__init__(backbone)
+        if coeff_window not in {1, 2, 4, 8}:
+            raise ValueError("coeff_window must be one of {1, 2, 4, 8}.")
+        self.coeff_window = coeff_window
+        self.luma_channels = coeff_window * coeff_window
+        self.chroma_channels = 2 * self.luma_channels
+        active_idx = _build_active_index(coeff_window)
+        if active_idx is not None:
+            self.register_buffer("active_idx", active_idx, persistent=False)
+        else:
+            self.active_idx = None
         mid_channels = max(self.target_channels, 64)
         self.luma_proj = nn.Sequential(
-            nn.Conv2d(64, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(self.luma_channels, mid_channels, kernel_size=1, padding=0, bias=False),
             nn.BatchNorm2d(mid_channels),
             nn.SiLU(inplace=True),
         )
         self.chroma_proj = nn.Sequential(
-            nn.Conv2d(128, mid_channels // 2, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(self.chroma_channels, mid_channels // 2, kernel_size=1, padding=0, bias=False),
             nn.BatchNorm2d(mid_channels // 2),
             nn.SiLU(inplace=True),
         )
@@ -188,8 +208,15 @@ class CompressedResNetBlockStem(_BackboneAdapter):
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
         cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
 
-        cb = cbcr_blocks[:, 0]
-        cr = cbcr_blocks[:, 1]
+        if self.active_idx is not None:
+            idx = self.active_idx.to(device)
+            y_blocks = torch.index_select(y_blocks, 1, idx)
+            cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
+            cr = torch.index_select(cbcr_blocks[:, 1], 1, idx)
+        else:
+            cb = cbcr_blocks[:, 0]
+            cr = cbcr_blocks[:, 1]
+
         chroma = torch.cat((cb, cr), dim=1)
         chroma = F.interpolate(chroma, size=y_blocks.shape[-2:], mode="nearest")
 
@@ -197,21 +224,31 @@ class CompressedResNetBlockStem(_BackboneAdapter):
         chroma_feat = self.chroma_proj(chroma)
         fused = self.fusion(torch.cat((y_feat, chroma_feat), dim=1))
         conv1_like = F.interpolate(fused, scale_factor=2.0, mode="bilinear", align_corners=False)
-        return self._forward_residual_stages(conv1_like)
+        return self._forward_residual_stages(conv1_like, skip_pool=True)
 
 
 class CompressedResNetLumaFusion(_BackboneAdapter):
-    def __init__(self, backbone: PResNet) -> None:
+    def __init__(self, backbone: PResNet, coeff_window: int) -> None:
         super().__init__(backbone)
+        if coeff_window not in {1, 2, 4, 8}:
+            raise ValueError("coeff_window must be one of {1, 2, 4, 8}.")
+        self.coeff_window = coeff_window
+        self.luma_channels = coeff_window * coeff_window
+        self.chroma_channels = 2 * self.luma_channels
+        active_idx = _build_active_index(coeff_window)
+        if active_idx is not None:
+            self.register_buffer("active_idx", active_idx, persistent=False)
+        else:
+            self.active_idx = None
         luma_width = max(self.target_channels, 64)
         chroma_width = luma_width // 2
         self.luma_down = nn.Sequential(
-            nn.Conv2d(64, luma_width, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.Conv2d(self.luma_channels, luma_width, kernel_size=1, stride=2, padding=0, bias=False),
             nn.BatchNorm2d(luma_width),
             nn.SiLU(inplace=True),
         )
         self.chroma_proj = nn.Sequential(
-            nn.Conv2d(128, chroma_width, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(self.chroma_channels, chroma_width, kernel_size=1, padding=0, bias=False),
             nn.BatchNorm2d(chroma_width),
             nn.SiLU(inplace=True),
         )
@@ -228,14 +265,21 @@ class CompressedResNetLumaFusion(_BackboneAdapter):
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
         cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
 
+        if self.active_idx is not None:
+            idx = self.active_idx.to(device)
+            y_blocks = torch.index_select(y_blocks, 1, idx)
+            cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
+            cr = torch.index_select(cbcr_blocks[:, 1], 1, idx)
+        else:
+            cb = cbcr_blocks[:, 0]
+            cr = cbcr_blocks[:, 1]
+
         luma_feat = self.luma_down(y_blocks)
-        cb = cbcr_blocks[:, 0]
-        cr = cbcr_blocks[:, 1]
         chroma = torch.cat((cb, cr), dim=1)
         chroma_feat = self.chroma_proj(chroma)
         fused = self.fusion(torch.cat((luma_feat, chroma_feat), dim=1))
         conv1_like = F.interpolate(fused, scale_factor=4.0, mode="bilinear", align_corners=False)
-        return self._forward_residual_stages(conv1_like)
+        return self._forward_residual_stages(conv1_like, skip_pool=True)
 
 
 class CompressedResNetLumaFusionPruned(_BackboneAdapter):
@@ -244,16 +288,24 @@ class CompressedResNetLumaFusionPruned(_BackboneAdapter):
         if coeff_window not in {1, 2, 4, 8}:
             raise ValueError("coeff_window must be one of {1, 2, 4, 8}.")
         scale = max(coeff_window / 8.0, 1.0 / 8.0)
+        self.coeff_window = coeff_window
+        self.luma_channels = coeff_window * coeff_window
+        self.chroma_channels = 2 * self.luma_channels
+        active_idx = _build_active_index(coeff_window)
+        if active_idx is not None:
+            self.register_buffer("active_idx", active_idx, persistent=False)
+        else:
+            self.active_idx = None
         self._shrink_backbone(scale)
         luma_width = max(self.target_channels, 8)
         chroma_width = max(luma_width // 2, 4)
         self.luma_down = nn.Sequential(
-            nn.Conv2d(64, luma_width, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.Conv2d(self.luma_channels, luma_width, kernel_size=1, stride=2, padding=0, bias=False),
             nn.BatchNorm2d(luma_width),
             nn.SiLU(inplace=True),
         )
         self.chroma_proj = nn.Sequential(
-            nn.Conv2d(128, chroma_width, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(self.chroma_channels, chroma_width, kernel_size=1, padding=0, bias=False),
             nn.BatchNorm2d(chroma_width),
             nn.SiLU(inplace=True),
         )
@@ -305,14 +357,21 @@ class CompressedResNetLumaFusionPruned(_BackboneAdapter):
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
         cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
 
+        if self.active_idx is not None:
+            idx = self.active_idx.to(device)
+            y_blocks = torch.index_select(y_blocks, 1, idx)
+            cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
+            cr = torch.index_select(cbcr_blocks[:, 1], 1, idx)
+        else:
+            cb = cbcr_blocks[:, 0]
+            cr = cbcr_blocks[:, 1]
+
         luma_feat = self.luma_down(y_blocks)
-        cb = cbcr_blocks[:, 0]
-        cr = cbcr_blocks[:, 1]
         chroma = torch.cat((cb, cr), dim=1)
         chroma_feat = self.chroma_proj(chroma)
         fused = self.fusion(torch.cat((luma_feat, chroma_feat), dim=1))
         conv1_like = F.interpolate(fused, scale_factor=4.0, mode="bilinear", align_corners=False)
-        return self._forward_residual_stages(conv1_like)
+        return self._forward_residual_stages(conv1_like, skip_pool=True)
 
 
 def build_compressed_backbone(
@@ -337,9 +396,9 @@ def build_compressed_backbone(
             std=std,
         )
     if variant == "block-stem":
-        return CompressedResNetBlockStem(backbone)
+        return CompressedResNetBlockStem(backbone, coeff_window=coeff_window)
     if variant == "luma-fusion":
-        return CompressedResNetLumaFusion(backbone)
+        return CompressedResNetLumaFusion(backbone, coeff_window=coeff_window)
     if variant == "luma-fusion-pruned":
         return CompressedResNetLumaFusionPruned(backbone, coeff_window=coeff_window)
     raise ValueError(f"Unsupported compressed backbone variant: {variant}")

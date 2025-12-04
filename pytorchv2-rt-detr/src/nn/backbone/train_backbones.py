@@ -33,7 +33,7 @@ import argparse
 import math
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -44,6 +44,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, MultiStepLR
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.transforms import v2 as T
+
+try:
+    import wandb  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
 
 from ...data.dataset.imagenet import ImageNetDataset
 from ...data.dataset.subset import limit_per_class, limit_total
@@ -168,6 +173,16 @@ def normalise_logits(logits: torch.Tensor) -> torch.Tensor:
     return logits
 
 
+def ensure_cuda_available() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU not detected. Please ensure a compatible device is available to run this script."
+        )
+    device_count = torch.cuda.device_count()
+    device_name = torch.cuda.get_device_name(0)
+    print(f"Detected {device_count} CUDA device(s); primary device: {device_name}")
+
+
 class SoftTargetCrossEntropy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -190,6 +205,8 @@ def build_resnet_transforms(
     image_size: int,
     compression: Optional[Dict[str, object]] = None,
     augmentation_overrides: Optional[Dict[str, object]] = None,
+    dct_normalizer_train: Optional[T.Transform] = None,
+    dct_normalizer_val: Optional[T.Transform] = None,
 ) -> Tuple[T.Transform, T.Transform]:
     image_size = _ensure_multiple_of(image_size, 8)
     crop_scale = _resolve_crop_scale(augmentation_overrides, (0.08, 1.0))
@@ -218,8 +235,12 @@ def build_resnet_transforms(
     else:
         train_ops.append(T.ToDtype(torch.float32, scale=True))
         train_ops.append(CompressToDCT(**compression))
+        if dct_normalizer_train is not None:
+            train_ops.append(dct_normalizer_train)
         val_ops.append(T.ToDtype(torch.float32, scale=True))
         val_ops.append(CompressToDCT(**compression))
+        if dct_normalizer_val is not None:
+            val_ops.append(dct_normalizer_val)
 
     return T.Compose(train_ops), T.Compose(val_ops)
 
@@ -710,13 +731,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-progress", action="store_true",
                         help="Show a tqdm progress bar while scanning dataset files.")
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging (requires wandb package).")
+    parser.add_argument("--wandb-project", default="rtdetr-backbones",
+                        help="Weights & Biases project name.")
+    parser.add_argument("--wandb-entity", default=None,
+                        help="Optional Weights & Biases entity/team.")
+    parser.add_argument("--wandb-run-name", default=None,
+                        help="Optional run name shown in the Weights & Biases UI.")
+    parser.add_argument("--wandb-tags", nargs="*", default=None,
+                        help="Optional list of tags for the Weights & Biases run.")
     return parser.parse_args()
 
 
 def main() -> None:
+    ensure_cuda_available()
     args = parse_args()
     cfg_map = default_configs()
     cfg = cfg_map[args.model]
+    wandb_run = None
 
     if args.epochs is not None:
         cfg.epochs = args.epochs
@@ -853,9 +886,24 @@ def main() -> None:
             f"lr {lr:.5f} | epoch time {elapsed/60:.2f} min | ETA {eta_minutes:.1f} min"
         )
 
+        if wandb_run is not None:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_stats["loss"],
+                "train/avg_step_time": train_stats["avg_step_time"],
+                "val/loss": val_stats["loss"],
+                "val/top1": val_stats["top1"],
+                "val/top5": val_stats["top5"],
+                "lr": lr,
+                "epoch_time_min": elapsed / 60.0,
+            })
+
         is_best = val_stats["top1"] > best_top1
         if is_best:
             best_top1 = val_stats["top1"]
+            if wandb_run is not None:
+                wandb_run.summary["best/top1"] = best_top1
+                wandb_run.summary["best/epoch"] = epoch + 1
 
         checkpoint = {
             "epoch": epoch,
@@ -870,6 +918,9 @@ def main() -> None:
         torch.save(checkpoint, output_dir / f"checkpoint_epoch_{epoch+1:04}.pth")
         if is_best:
             torch.save(checkpoint, output_dir / "checkpoint_best.pth")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
