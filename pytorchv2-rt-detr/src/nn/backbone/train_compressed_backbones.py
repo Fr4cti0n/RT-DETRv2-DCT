@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import random
 import time
 from pathlib import Path
 
 import torch
 from torch import nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
 
@@ -51,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--eta-min", type=float, default=0.0,
-                        help="Minimum learning rate for cosine annealing schedule.")
+                        help="Minimum learning rate placeholder (unused with step schedule; retained for CLI compatibility).")
     parser.add_argument("--warmup-epochs", type=int, default=0,
                         help="Number of linear warmup epochs applied before cosine decay.")
     parser.add_argument("--coeff-window", type=int, choices=[1, 2, 4, 8], default=4)
@@ -99,6 +100,12 @@ def parse_args() -> argparse.Namespace:
                         help="Path to a checkpoint to resume training from.")
     parser.add_argument("--dct-stats", type=Path, default=None,
                         help="Optional path to a .pt file with per-coefficient DCT statistics for normalisation.")
+    parser.add_argument("--lr-milestones", type=int, nargs="*", default=[30, 60, 90],
+                        help="Epoch milestones (1-indexed) where the learning rate is multiplied by lr_gamma.")
+    parser.add_argument("--lr-gamma", type=float, default=0.1,
+                        help="Multiplicative factor applied to the learning rate at each milestone (default: 0.1).")
+    parser.add_argument("--time-limit-hours", type=float, default=1.0,
+                        help="Maximum wall-clock time for training (hours, 0 disables the limit).")
     return parser.parse_args()
 
 
@@ -241,6 +248,7 @@ def train_one_epoch(
     use_amp: bool,
     scaler: torch.cuda.amp.GradScaler | None,
     print_freq: int = 50,
+    time_limit_seconds: float | None = None,
 ) -> dict[str, float]:
     model.train()
     running_loss = 0.0
@@ -249,7 +257,11 @@ def train_one_epoch(
     total = 0
     last_log = time.time()
     epoch_start_time = time.time()
+    time_limit_reached = False
     for step, (inputs, targets) in enumerate(loader):
+        if time_limit_seconds and time.time() - run_start_time >= time_limit_seconds:
+            time_limit_reached = True
+            break
         inputs = _move_to_device(inputs, device)
         targets = targets.to(device)
         optimizer.zero_grad()
@@ -308,6 +320,7 @@ def train_one_epoch(
         "loss": running_loss / max(total, 1),
         "acc1": correct1 / max(total, 1),
         "acc5": correct5 / max(total, 1),
+        "time_limit_reached": time_limit_reached,
     }
 
 
@@ -409,10 +422,16 @@ def main() -> None:
             f"Adjusted learning rate from {args.lr:.5f} (base) to {effective_lr:.5f} "
             f"for batch size {args.batch_size} (cap={_LR_CAP:.5f})."
         )
+    milestones = sorted(m for m in args.lr_milestones if m > 0)
+    if not milestones:
+        milestones = [30, 60, 80]
     warmup_epochs = max(0, args.warmup_epochs)
-    cosine_duration = max(1, args.epochs - warmup_epochs)
     if warmup_epochs > 0:
-        print(f"Applying {warmup_epochs} warmup epoch(s) before cosine decay.")
+        print(f"Applying {warmup_epochs} warmup epoch(s) before step LR milestones {milestones}.")
+    time_limit_hours = args.time_limit_hours if args.time_limit_hours > 0 else None
+    if time_limit_hours is not None:
+        print(f"Enforcing wall-clock time limit of {time_limit_hours:.2f}h.")
+    time_limit_seconds = time_limit_hours * 3600.0 if time_limit_hours is not None else None
 
     if args.wandb:
         if wandb is None:
@@ -441,6 +460,7 @@ def main() -> None:
             "val_dir": str(args.val_dir),
             "channels_last": args.channels_last,
             "dct_stats_path": str(stats_path_resolved) if stats_path_resolved is not None else None,
+            "time_limit_hours": time_limit_hours,
         }
         default_name = f"{args.variant}_{args.coeff_window}"
         run_name = args.wandb_run_name or default_name
@@ -476,21 +496,34 @@ def main() -> None:
         momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=cosine_duration, eta_min=args.eta_min)
+    scheduler = MultiStepLR(optimizer, milestones=milestones, gamma=args.lr_gamma)
     criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = args.checkpoint_dir or output_dir
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_acc = 0.0
-    start_epoch = 1
+    run_subdir_name = f"{args.variant}_coeff{args.coeff_window}"
+    base_output_dir = args.output_dir
+    base_checkpoint_dir = args.checkpoint_dir or base_output_dir
 
     resume_path: Path | None = None
     if args.resume is not None:
-        resume_path = args.resume
-    elif args.auto_resume:
+        resume_path = args.resume.expanduser()
+        if resume_path.is_dir():
+            resume_path = resume_path / "checkpoint_last.pth"
+        resume_dir = resume_path.parent
+        output_dir = resume_dir
+        checkpoint_dir = resume_dir
+    else:
+        output_dir = base_output_dir / run_subdir_name
+        checkpoint_dir = base_checkpoint_dir / run_subdir_name
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = checkpoint_dir / "training_params.csv"
+    best_acc = 0.0
+    start_epoch = 1
+
+    if resume_path is None and args.auto_resume:
         candidate = checkpoint_dir / "checkpoint_last.pth"
         if candidate.exists():
             resume_path = candidate
@@ -517,7 +550,52 @@ def main() -> None:
                 wandb_run.finish()
             return
 
+    timestamp_now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    params_to_record = {
+        "variant": args.variant,
+        "coeff_window": args.coeff_window,
+        "range_mode": args.range_mode,
+        "image_size": args.image_size,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "start_epoch": start_epoch,
+        "lr": args.lr,
+        "effective_lr": effective_lr,
+        "lr_milestones": " ".join(str(m) for m in milestones),
+        "lr_gamma": args.lr_gamma,
+        "warmup_epochs": warmup_epochs,
+        "momentum": args.momentum,
+        "weight_decay": args.weight_decay,
+        "eta_min": args.eta_min,
+        "train_samples": len(train_loader.dataset),
+        "val_samples": len(val_loader.dataset),
+        "seed": args.seed,
+        "train_dirs": ";".join(str(p) for p in args.train_dirs),
+        "val_dir": str(args.val_dir),
+        "channels_last": args.channels_last,
+        "dct_stats_path": str(stats_path_resolved) if stats_path_resolved is not None else "",
+        "time_limit_hours": time_limit_hours if time_limit_hours is not None else "none",
+        "output_dir": str(output_dir),
+        "checkpoint_dir": str(checkpoint_dir),
+        "resume_checkpoint": str(resume_path) if resume_path is not None else "",
+        "timestamp": timestamp_now,
+    }
+    csv_exists = csv_path.exists()
+    with csv_path.open("a" if csv_exists else "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        if not csv_exists:
+            writer.writerow(["parameter", "value"])
+            for key, value in params_to_record.items():
+                writer.writerow([key, value])
+        else:
+            writer.writerow(["resume_timestamp", timestamp_now])
+            writer.writerow(["resume_start_epoch", start_epoch])
+            if resume_path is not None:
+                writer.writerow(["resume_checkpoint", str(resume_path)])
+
     run_start_time = time.time()
+
+    time_limit_triggered = False
 
     if args.preview_sample:
         if args.variant != "reconstruction":
@@ -532,6 +610,10 @@ def main() -> None:
             return
 
     for epoch in range(start_epoch, args.epochs + 1):
+        if time_limit_seconds and time.time() - run_start_time >= time_limit_seconds:
+            print("Time limit reached before starting new epoch; stopping training loop.")
+            time_limit_triggered = True
+            break
         print(f"Epoch {epoch}/{args.epochs}")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -557,8 +639,30 @@ def main() -> None:
             use_amp=args.amp,
             scaler=scaler,
             print_freq=args.print_freq,
+            time_limit_seconds=time_limit_seconds,
         )
+        if stats.get("time_limit_reached"):
+            print("Time limit reached during training phase; terminating without evaluation.")
+            time_limit_triggered = True
+            break
         val_stats = evaluate(model, val_loader, criterion, device)
+        if time_limit_seconds and time.time() - run_start_time >= time_limit_seconds:
+            print("Time limit reached after evaluation; stopping training loop.")
+            time_limit_triggered = True
+            current_lr = optimizer.param_groups[0]["lr"]
+            next_lr = current_lr
+            acc1 = val_stats["acc1"]
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                gpu_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            else:
+                gpu_mem = None
+            print(
+                f"  train loss={stats['loss']:.4f} acc@1={stats['acc1']:.4f} acc@5={stats['acc5']:.4f} | "
+                f"val loss={val_stats['loss']:.4f} acc@1={val_stats['acc1']:.4f} acc@5={val_stats['acc5']:.4f}"
+                + (f" gpu_mem={gpu_mem:.1f}MB" if gpu_mem is not None else "")
+            )
+            break
         current_lr = optimizer.param_groups[0]["lr"]
         if not warmup_active:
             scheduler.step()
@@ -642,6 +746,8 @@ def main() -> None:
             )
 
     print(f"Training complete. Best val acc@1={best_acc:.4f}")
+    if time_limit_triggered:
+        print("Stopped early due to the configured time limit.")
     if wandb_run is not None:
         wandb_run.finish()
 
