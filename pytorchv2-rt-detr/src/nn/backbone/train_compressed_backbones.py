@@ -39,8 +39,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     wandb = None
 _NUM_CLASSES = 1000
-_LR_REFERENCE_BATCH = 16
-_LR_CAP = 0.4
+_LR_REFERENCE_BATCH = 256
+_LR_CAP = 0.1
 
 
 def parse_args() -> argparse.Namespace:
@@ -784,9 +784,11 @@ def main() -> None:
             print(f"[trimmed-val] Failed to evaluate trimmed dataloader: {exc}")
 
     benchmark_results: list[tuple[int, BenchmarkResult]] = []
+    benchmark_csv_rows: list[dict[str, object]] = []
     if not args.benchmark_disable and args.benchmark_measure_batches > 0:
         benchmark_batch_sizes = [1, 8, 32, 64, 128, 256]
         benchmark_max_samples = args.benchmark_max_samples if args.benchmark_max_samples > 0 else None
+        benchmark_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         for bench_bs in benchmark_batch_sizes:
             try:
                 result = run_trimmed_inference_benchmark(
@@ -809,6 +811,44 @@ def main() -> None:
                 continue
             if result is not None:
                 benchmark_results.append((bench_bs, result))
+                benchmark_csv_rows.append({
+                    "timestamp": benchmark_timestamp,
+                    "variant": args.variant,
+                    "coeff_window": args.coeff_window,
+                    "image_size": args.image_size,
+                    "batch_size": bench_bs,
+                    "samples": result.samples,
+                    "measured_batches": result.measured_batches,
+                    "throughput_img_s": result.throughput_img_s,
+                    "mean_latency_ms": result.mean_latency_ms,
+                    "input_mb_per_batch": result.input_mb_per_batch,
+                    "peak_memory_mb": result.peak_memory_mb,
+                    "coeff_channels": result.coeff_channels,
+                })
+
+    if benchmark_csv_rows:
+        benchmark_csv_path = checkpoint_dir / "benchmark_metrics.csv"
+        csv_exists = benchmark_csv_path.exists()
+        fieldnames = [
+            "timestamp",
+            "variant",
+            "coeff_window",
+            "image_size",
+            "batch_size",
+            "samples",
+            "measured_batches",
+            "throughput_img_s",
+            "mean_latency_ms",
+            "input_mb_per_batch",
+            "peak_memory_mb",
+            "coeff_channels",
+        ]
+        with benchmark_csv_path.open("a" if csv_exists else "w", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            if not csv_exists:
+                writer.writeheader()
+            for row in benchmark_csv_rows:
+                writer.writerow(row)
 
     if trimmed_val_stats is not None:
         print(
