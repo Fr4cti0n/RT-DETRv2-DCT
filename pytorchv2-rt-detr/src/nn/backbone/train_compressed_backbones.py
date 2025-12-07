@@ -20,6 +20,11 @@ from ...data.dataset.subset import limit_total
 from ...data.transforms.dct_normalize import NormalizeDCTCoefficients
 from ..arch.classification import ClassHead
 from .compressed_presnet import build_compressed_backbone
+from .inference_benchmark import (
+    BenchmarkResult,
+    build_trimmed_eval_loader,
+    run_trimmed_inference_benchmark,
+)
 from .train_backbones import (
     _IMAGENET_MEAN,
     _IMAGENET_STD,
@@ -34,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     wandb = None
 _NUM_CLASSES = 1000
-_LR_REFERENCE_BATCH = 256
+_LR_REFERENCE_BATCH = 16
 _LR_CAP = 0.4
 
 
@@ -106,6 +111,18 @@ def parse_args() -> argparse.Namespace:
                         help="Multiplicative factor applied to the learning rate at each milestone (default: 0.1).")
     parser.add_argument("--time-limit-hours", type=float, default=1.0,
                         help="Maximum wall-clock time for training (hours, 0 disables the limit).")
+    parser.add_argument("--benchmark-disable", action="store_true",
+                        help="Skip trimmed-input inference benchmarking after training.")
+    parser.add_argument("--benchmark-max-samples", type=int, default=128,
+                        help="Maximum validation samples used during trimmed-input benchmarking (default: 128).")
+    parser.add_argument("--benchmark-warmup-batches", type=int, default=5,
+                        help="Warmup batches discarded before timing inference (default: 5).")
+    parser.add_argument("--benchmark-measure-batches", type=int, default=20,
+                        help="Number of timed batches during trimmed-input benchmarking (default: 20).")
+    parser.add_argument("--benchmark-workers", type=int, default=2,
+                        help="Number of workers for trimmed-input benchmarking (default: 2).")
+    parser.add_argument("--trimmed-val-disable", action="store_true",
+                        help="Skip accuracy evaluation using the trimmed-input dataloader.")
     return parser.parse_args()
 
 
@@ -736,7 +753,7 @@ def main() -> None:
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
-                        "scaler": scaler.state_dict() if scaler is not None else None,
+                    "scaler": scaler.state_dict() if scaler is not None else None,
                     "variant": args.variant,
                     "coeff_window": args.coeff_window,
                     "range_mode": args.range_mode,
@@ -744,6 +761,94 @@ def main() -> None:
                 },
                 checkpoint_dir / f"checkpoint_{epoch:04d}.pth",
             )
+
+    trimmed_val_stats: dict[str, float] | None = None
+    if not args.trimmed_val_disable:
+        try:
+            trimmed_loader = build_trimmed_eval_loader(
+                val_dirs=[str(Path(args.val_dir))],
+                image_size=args.image_size,
+                batch_size=args.batch_size,
+                workers=args.workers,
+                compression_cfg=compression_cfg,
+                coeff_window=args.coeff_window,
+                max_samples=args.max_val_images,
+                dct_normalizer=normalizer_val,
+                show_progress=args.show_progress,
+            )
+            if len(trimmed_loader) == 0:
+                print("[trimmed-val] Validation dataset is empty; skipping trimmed evaluation.")
+            else:
+                trimmed_val_stats = evaluate(model, trimmed_loader, criterion, device)
+        except Exception as exc:  # pragma: no cover - trimmed validation is best-effort
+            print(f"[trimmed-val] Failed to evaluate trimmed dataloader: {exc}")
+
+    benchmark_results: list[tuple[int, BenchmarkResult]] = []
+    if not args.benchmark_disable and args.benchmark_measure_batches > 0:
+        benchmark_batch_sizes = [1, 8, 32, 64, 128, 256]
+        benchmark_max_samples = args.benchmark_max_samples if args.benchmark_max_samples > 0 else None
+        for bench_bs in benchmark_batch_sizes:
+            try:
+                result = run_trimmed_inference_benchmark(
+                    model,
+                    device=device,
+                    coeff_window=args.coeff_window,
+                    image_size=args.image_size,
+                    batch_size=bench_bs,
+                    val_dirs=[str(Path(args.val_dir))],
+                    compression_cfg=compression_cfg,
+                    dct_normalizer=normalizer_val,
+                    max_samples=benchmark_max_samples,
+                    workers=args.benchmark_workers,
+                    warmup_batches=max(0, args.benchmark_warmup_batches),
+                    measure_batches=max(0, args.benchmark_measure_batches),
+                    show_progress=args.show_progress,
+                )
+            except Exception as exc:  # pragma: no cover - benchmark is best-effort
+                print(f"[benchmark] Failed for batch size {bench_bs}: {exc}")
+                continue
+            if result is not None:
+                benchmark_results.append((bench_bs, result))
+
+    if trimmed_val_stats is not None:
+        print(
+            "[trimmed-val] acc@1={acc1:.4f} acc@5={acc5:.4f} loss={loss:.4f}".format(
+                acc1=trimmed_val_stats["acc1"],
+                acc5=trimmed_val_stats["acc5"],
+                loss=trimmed_val_stats["loss"],
+            )
+        )
+        if wandb_run is not None:
+            wandb_run.summary.update({
+                "trimmed_val/acc1": trimmed_val_stats["acc1"],
+                "trimmed_val/acc5": trimmed_val_stats["acc5"],
+                "trimmed_val/loss": trimmed_val_stats["loss"],
+            })
+
+    for batch_size, benchmark_result in benchmark_results:
+        peak_text = (
+            f" | peak_mem={benchmark_result.peak_memory_mb:.1f}MB"
+            if benchmark_result.peak_memory_mb is not None
+            else ""
+        )
+        print(
+            f"[benchmark] trimmed inference (bs={batch_size}): "
+            f"{benchmark_result.throughput_img_s:.2f} img/s | "
+            f"{benchmark_result.mean_latency_ms:.2f} ms/batch | "
+            f"coeffs={benchmark_result.coeff_channels} | "
+            f"input={benchmark_result.input_mb_per_batch:.2f} MB/batch"
+            f"{peak_text}"
+        )
+        if wandb_run is not None:
+            wandb_run.summary.update({
+                f"benchmark/bs{batch_size}/samples": benchmark_result.samples,
+                f"benchmark/bs{batch_size}/measured_batches": benchmark_result.measured_batches,
+                f"benchmark/bs{batch_size}/throughput_img_s": benchmark_result.throughput_img_s,
+                f"benchmark/bs{batch_size}/mean_latency_ms": benchmark_result.mean_latency_ms,
+                f"benchmark/bs{batch_size}/input_mb_per_batch": benchmark_result.input_mb_per_batch,
+                f"benchmark/bs{batch_size}/coeff_channels": benchmark_result.coeff_channels,
+                f"benchmark/bs{batch_size}/peak_memory_mb": benchmark_result.peak_memory_mb,
+            })
 
     print(f"Training complete. Best val acc@1={best_acc:.4f}")
     if time_limit_triggered:
