@@ -20,6 +20,7 @@ import torch
 from torchvision.transforms import v2 as T
 
 from .frame_dct import FrameDCT
+from ...core import register
 
 RangeMode = tuple[str, ...]
 
@@ -206,6 +207,7 @@ def _resolve_torch_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
     raise ValueError(f"Unsupported dtype specification: {dtype!r}")
 
 
+@register()
 class CompressToDCT(T.Transform):
     """Transform that converts an RGB tensor into DCT coefficient blocks.
 
@@ -236,21 +238,32 @@ class CompressToDCT(T.Transform):
     @staticmethod
     def _to_bgr_array(image: TensorLike) -> np.ndarray:
         if isinstance(image, torch.Tensor):
-            if image.ndim != 3:
-                raise ValueError("Expected a 3D tensor (C, H, W) for compression.")
             tensor = image.detach().cpu()
-            if tensor.shape[0] == 1:
-                tensor = tensor.repeat(3, 1, 1)
-            elif tensor.shape[0] != 3:
-                raise ValueError(
-                    f"Unsupported channel count for compression: {tensor.shape[0]}"
-                )
-            if tensor.dtype.is_floating_point:
-                tensor = tensor.clamp(0.0, 1.0) * 255.0
-                tensor = tensor.round()
+            if tensor.ndim == 2:
+                tensor = tensor.unsqueeze(0)
+            if tensor.ndim != 3:
+                raise ValueError("Expected image tensor with 3 dimensions for compression.")
+
+            if tensor.shape[0] in (1, 3):
+                channel_first = tensor
+            elif tensor.shape[-1] in (1, 3):
+                # torchvision v2 tv_tensors keep channels in the last dimension.
+                channel_first = tensor.permute(2, 0, 1)
             else:
-                tensor = tensor.to(torch.float32)
-            array = tensor.permute(1, 2, 0).numpy()
+                raise ValueError(
+                    "Unsupported channel layout for compression; expected 1 or 3 channels."
+                )
+
+            if channel_first.shape[0] == 1:
+                channel_first = channel_first.repeat(3, 1, 1)
+
+            if channel_first.dtype.is_floating_point:
+                channel_first = channel_first.clamp(0.0, 1.0) * 255.0
+                channel_first = channel_first.round()
+            else:
+                channel_first = channel_first.to(torch.float32)
+
+            array = channel_first.permute(1, 2, 0).numpy()
         elif isinstance(image, np.ndarray):
             array = np.asarray(image)
             if array.ndim == 2:
@@ -279,7 +292,7 @@ class CompressToDCT(T.Transform):
         tensor = torch.from_numpy(blocks).permute(2, 0, 1)
         return tensor.to(dtype)
 
-    def forward(self, image: TensorLike, target=None):
+    def _compress(self, image: TensorLike, target=None):
         original = image if self.keep_original else None
         bgr_image = self._to_bgr_array(image)
         luma_blocks, cb_blocks, cr_blocks, metadata = _compress_image_array(
@@ -306,6 +319,20 @@ class CompressToDCT(T.Transform):
         if self.keep_original:
             payload = (payload, original)
 
+        return payload, target
+
+    def forward(self, inputs: TensorLike | tuple, target=None):
+        if target is None and isinstance(inputs, (tuple, list)):
+            if len(inputs) == 3:
+                image, tgt, dataset = inputs
+                payload, tgt = self._compress(image, tgt)
+                return payload, tgt, dataset
+            if len(inputs) == 2:
+                image, tgt = inputs
+                payload, tgt = self._compress(image, tgt)
+                return payload, tgt
+
+        payload, target = self._compress(inputs, target)
         if target is None:
             return payload
         return payload, target

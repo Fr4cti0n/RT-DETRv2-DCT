@@ -15,6 +15,11 @@ from .presnet import (
     BasicBlock,
     BottleNeck,
 )
+from ...core import register
+
+
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class _DCTBlockDecoder(nn.Module):
@@ -372,6 +377,59 @@ class CompressedResNetLumaFusionPruned(_BackboneAdapter):
         fused = self.fusion(torch.cat((luma_feat, chroma_feat), dim=1))
         conv1_like = F.interpolate(fused, scale_factor=4.0, mode="bilinear", align_corners=False)
         return self._forward_residual_stages(conv1_like, skip_pool=True)
+
+
+@register()
+class CompressedPResNet(nn.Module):
+    """Factory module that wraps :class:`PResNet` with a compressed-input adapter."""
+
+    def __init__(
+        self,
+        compression_variant: Literal[
+            "reconstruction",
+            "block-stem",
+            "luma-fusion",
+            "luma-fusion-pruned",
+        ],
+        coeff_window: int = 8,
+        range_mode: str = "studio",
+        mean: Sequence[float] = _IMAGENET_MEAN,
+        std: Sequence[float] = _IMAGENET_STD,
+        strict_load: bool = False,
+        **backbone_kwargs,
+    ) -> None:
+        super().__init__()
+
+        compressed_pretrained = backbone_kwargs.pop("compressed_pretrained", None)
+        base_pretrained = backbone_kwargs.pop("pretrained", False)
+
+        backbone = PResNet(pretrained=base_pretrained, **backbone_kwargs)
+        self.backbone = build_compressed_backbone(
+            compression_variant,
+            backbone,
+            range_mode=range_mode,
+            mean=mean,
+            std=std,
+            coeff_window=coeff_window,
+        )
+
+        if compressed_pretrained:
+            state = torch.load(compressed_pretrained, map_location="cpu")
+            if isinstance(state, dict) and "model" in state:
+                state = state["model"]
+            missing, unexpected = self.backbone.load_state_dict(state, strict=strict_load)
+            if missing or unexpected:
+                print(
+                    "Warning: loading compressed backbone weights, "
+                    f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+                )
+
+        self.return_idx = list(self.backbone.return_idx)
+        self.out_channels = list(self.backbone.out_channels)
+        self.out_strides = list(self.backbone.out_strides)
+
+    def forward(self, inputs):
+        return self.backbone(inputs)
 
 
 def build_compressed_backbone(

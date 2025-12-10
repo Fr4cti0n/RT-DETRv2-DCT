@@ -58,9 +58,27 @@ class DataLoader(data.DataLoader):
 
 @register()
 def batch_image_collate_fn(items):
-    """only batch image
-    """
-    return torch.cat([x[0][None] for x in items], dim=0), [x[1] for x in items]
+    """Collate helper that supports tensor images and DCT payloads."""
+    if not items:
+        raise ValueError("batch_image_collate_fn received an empty batch")
+
+    first_sample = items[0][0]
+
+    if torch.is_tensor(first_sample):
+        images = torch.cat([sample[0][None] for sample in items], dim=0)
+        targets = [sample[1] for sample in items]
+        return images, targets
+
+    if isinstance(first_sample, (tuple, list)) and len(first_sample) == 2:
+        y_blocks = torch.stack([sample[0][0] for sample in items], dim=0)
+        cbcr_blocks = torch.stack([sample[0][1] for sample in items], dim=0)
+        targets = [sample[1] for sample in items]
+        return (y_blocks, cbcr_blocks), targets
+
+    raise TypeError(
+        "batch_image_collate_fn expects a tensor or (y_blocks, cbcr_blocks) payload, "
+        f"but received {type(first_sample).__name__}."
+    )
 
 
 class BaseCollateFunction(object):
@@ -88,10 +106,27 @@ class BatchImageCollateFuncion(BaseCollateFunction):
         # self.interpolation = interpolation
 
     def __call__(self, items):
-        images = torch.cat([x[0][None] for x in items], dim=0)
+        first_sample = items[0][0]
+
+        if torch.is_tensor(first_sample):
+            images = torch.cat([sample[0][None] for sample in items], dim=0)
+        elif isinstance(first_sample, (tuple, list)) and len(first_sample) == 2:
+            y_blocks = torch.stack([sample[0][0] for sample in items], dim=0)
+            cbcr_blocks = torch.stack([sample[0][1] for sample in items], dim=0)
+            images = (y_blocks, cbcr_blocks)
+        else:
+            raise TypeError(
+                "BatchImageCollateFuncion expects each sample to be a tensor or a (y_blocks, cbcr_blocks) tuple, "
+                f"but received {type(first_sample).__name__}."
+            )
+
         targets = [x[1] for x in items]
 
-        if self.scales is not None and self.epoch < self.stop_epoch:
+        if (
+            self.scales is not None
+            and self.epoch < self.stop_epoch
+            and torch.is_tensor(images)
+        ):
             # sz = random.choice(self.scales)
             # sz = [sz] if isinstance(sz, int) else list(sz)
             # VF.resize(inpt, sz, interpolation=self.interpolation)
@@ -102,6 +137,16 @@ class BatchImageCollateFuncion(BaseCollateFunction):
                 for tg in targets:
                     tg['masks'] = F.interpolate(tg['masks'], size=sz, mode='nearest')
                 raise NotImplementedError('')
+
+        if (
+            self.scales is not None
+            and self.epoch < self.stop_epoch
+            and isinstance(images, tuple)
+        ):
+            raise NotImplementedError(
+                "Multiscale interpolation is not supported for DCT payloads. "
+                "Set collate_fn.scales to null when training with compressed inputs."
+            )
 
         return images, targets
 

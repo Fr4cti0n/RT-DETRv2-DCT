@@ -39,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     wandb = None
 _NUM_CLASSES = 1000
-_LR_REFERENCE_BATCH = 256
+_LR_REFERENCE_BATCH = 512
 _LR_CAP = 0.1
 
 
@@ -111,8 +111,9 @@ def parse_args() -> argparse.Namespace:
                         help="Multiplicative factor applied to the learning rate at each milestone (default: 0.1).")
     parser.add_argument("--time-limit-hours", type=float, default=1.0,
                         help="Maximum wall-clock time for training (hours, 0 disables the limit).")
-    parser.add_argument("--benchmark-disable", action="store_true",
-                        help="Skip trimmed-input inference benchmarking after training.")
+    parser.add_argument("--benchmark", dest="benchmark_enabled", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run trimmed-input inference benchmarking after training (use --no-benchmark to skip).")
+    parser.add_argument("--benchmark-disable", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--benchmark-max-samples", type=int, default=128,
                         help="Maximum validation samples used during trimmed-input benchmarking (default: 128).")
     parser.add_argument("--benchmark-warmup-batches", type=int, default=5,
@@ -123,7 +124,13 @@ def parse_args() -> argparse.Namespace:
                         help="Number of workers for trimmed-input benchmarking (default: 2).")
     parser.add_argument("--trimmed-val-disable", action="store_true",
                         help="Skip accuracy evaluation using the trimmed-input dataloader.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if getattr(args, "benchmark_disable", False):
+        print("[cli] --benchmark-disable is deprecated; use --no-benchmark instead.")
+        args.benchmark_enabled = False
+    if not hasattr(args, "benchmark_enabled"):
+        args.benchmark_enabled = True
+    return args
 
 
 def build_dataloaders(
@@ -785,7 +792,7 @@ def main() -> None:
 
     benchmark_results: list[tuple[int, BenchmarkResult]] = []
     benchmark_csv_rows: list[dict[str, object]] = []
-    if not args.benchmark_disable and args.benchmark_measure_batches > 0:
+    if args.benchmark_enabled and args.benchmark_measure_batches > 0:
         benchmark_batch_sizes = [1, 8, 32, 64, 128, 256]
         benchmark_max_samples = args.benchmark_max_samples if args.benchmark_max_samples > 0 else None
         benchmark_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())

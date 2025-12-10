@@ -8,6 +8,7 @@ from .common import (
 )
 from .presnet import PResNet, ResNet
 from .compressed_presnet import (
+    CompressedPResNet,
     CompressedResNetBlockStem,
     CompressedResNetLumaFusion,
     CompressedResNetLumaFusionPruned,

@@ -19,6 +19,18 @@ from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
 
+def _move_to_device(sample, device):
+    if torch.is_tensor(sample):
+        return sample.to(device)
+    if isinstance(sample, tuple):
+        return tuple(_move_to_device(component, device) for component in sample)
+    if isinstance(sample, list):
+        return [_move_to_device(component, device) for component in sample]
+    if hasattr(sample, "to"):
+        return sample.to(device)
+    return sample
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
@@ -36,8 +48,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        samples = _move_to_device(samples, device)
+        targets = [{k: _move_to_device(v, device) for k, v in t.items()} for t in targets]
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step)
 
@@ -114,8 +126,8 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
     header = 'Test:'
     
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
-        samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        samples = _move_to_device(samples, device)
+        targets = [{k: _move_to_device(v, device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
 

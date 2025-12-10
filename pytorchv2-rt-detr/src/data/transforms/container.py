@@ -22,7 +22,13 @@ class Compose(T.Compose):
             for op in ops:
                 if isinstance(op, dict):
                     name = op.pop('type')
-                    transfom = getattr(GLOBAL_CONFIG[name]['_pymodule'], GLOBAL_CONFIG[name]['_name'])(**op)
+                    registry_entry = GLOBAL_CONFIG[name]
+                    if isinstance(registry_entry, dict):
+                        transfom = getattr(registry_entry['_pymodule'], registry_entry['_name'])(**op)
+                    elif callable(registry_entry):
+                        transfom = registry_entry(**op)
+                    else:
+                        raise TypeError(f"Unsupported registry entry type for {name}: {type(registry_entry)!r}")
                     transforms.append(transfom)
                     op['type'] = name
 

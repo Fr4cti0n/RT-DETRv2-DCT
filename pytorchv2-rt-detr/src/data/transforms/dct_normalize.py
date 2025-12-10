@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, Tuple
 
 import torch
 from torchvision.transforms import v2 as T
+from ...core import register
 
 
 def _as_tensor(data: Iterable[float] | torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
@@ -25,6 +26,7 @@ def _build_frequency_mask(coeff_window: int) -> torch.Tensor:
     return mask
 
 
+@register()
 class NormalizeDCTCoefficients(T.Transform):
     """Normalise DCT coefficient tensors using pre-computed statistics.
 
@@ -90,13 +92,11 @@ class NormalizeDCTCoefficients(T.Transform):
         cbcr_norm = mask_chroma * norm_cbcr + (1.0 - mask_chroma) * cbcr_blocks
         return y_norm, cbcr_norm
 
-    def forward(self, inputs: Any, target: Any = None):  # noqa: D401 - signature mirrors torchvision
-        if isinstance(inputs, tuple) and len(inputs) == 2:
-            first, second = inputs
-            # Case 1: (y_blocks, cbcr_blocks)
+    def _normalise_payload(self, payload: Any) -> Any:
+        if isinstance(payload, tuple) and len(payload) == 2:
+            first, second = payload
             if torch.is_tensor(first) and torch.is_tensor(second):
                 return self._normalise_pair(first, second)
-            # Case 2: ((y_blocks, cbcr_blocks), original)
             if (
                 isinstance(first, tuple)
                 and len(first) == 2
@@ -108,6 +108,22 @@ class NormalizeDCTCoefficients(T.Transform):
         raise TypeError(
             "NormalizeDCTCoefficients expects payloads produced by CompressToDCT"
         )
+
+    def forward(self, inputs: Any, target: Any = None):  # noqa: D401 - signature mirrors torchvision
+        if isinstance(inputs, tuple):
+            if (
+                len(inputs) == 2
+                and torch.is_tensor(inputs[0])
+                and torch.is_tensor(inputs[1])
+            ):
+                return self._normalise_payload(inputs)
+
+            payload = self._normalise_payload(inputs[0])
+            if len(inputs) == 1:
+                return payload
+            return (payload, *inputs[1:])
+
+        return self._normalise_payload(inputs)
 
     @classmethod
     def from_file(
@@ -131,4 +147,14 @@ class NormalizeDCTCoefficients(T.Transform):
             coeff_window=coeff_window,
         )
 
-__all__ = ["NormalizeDCTCoefficients"]
+@register()
+def NormalizeDCTCoefficientsFromFile(
+    path: Path | str,
+    *,
+    eps: float = 1e-6,
+    coeff_window: int | None = None,
+) -> NormalizeDCTCoefficients:
+    return NormalizeDCTCoefficients.from_file(path, eps=eps, coeff_window=coeff_window)
+
+
+__all__ = ["NormalizeDCTCoefficients", "NormalizeDCTCoefficientsFromFile"]
