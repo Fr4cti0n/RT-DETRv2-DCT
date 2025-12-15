@@ -1,17 +1,90 @@
 """Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import torch 
+import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-import re 
+import re
 import copy
 
 from ._config import BaseConfig
 from .workspace import create
 from .yaml_utils import load_config, merge_config, merge_dict
+
+
+def _find_divisor(value: int, preferred: int) -> int:
+    if preferred <= 0:
+        preferred = 1
+    if value % preferred == 0:
+        return preferred
+    for candidate in range(min(preferred, value), 0, -1):
+        if value % candidate == 0:
+            return candidate
+    return 1
+
+
+def _apply_pruned_overrides(cfg: dict) -> dict:
+    compressed = cfg.get('CompressedPResNet')
+    if not isinstance(compressed, dict):
+        return cfg
+    if compressed.get('compression_variant') != 'luma-fusion-pruned':
+        return cfg
+
+    coeff = compressed.get('coeff_window', 8)
+    try:
+        coeff_val = int(coeff)
+    except (TypeError, ValueError):
+        coeff_val = 8
+    scale = max(coeff_val / 8.0, 1.0 / 8.0)
+
+    def _scale_value(base: int, minimum: int) -> int:
+        return max(minimum, int(round(base * scale)))
+
+    # Hybrid encoder adjustments
+    encoder_cfg = cfg.setdefault('HybridEncoder', {})
+    base_hidden = encoder_cfg.get('hidden_dim', 256)
+    enc_hidden = _scale_value(base_hidden, 32)
+    encoder_cfg['hidden_dim'] = enc_hidden
+    base_ff = encoder_cfg.get('dim_feedforward', 1024)
+    encoder_cfg['dim_feedforward'] = max(enc_hidden * 2, _scale_value(base_ff, 64))
+    base_heads = encoder_cfg.get('nhead', 8)
+    encoder_cfg['nhead'] = max(1, min(4, _find_divisor(enc_hidden, base_heads)))
+    base_depth_mult = encoder_cfg.get('depth_mult', 1.0)
+    encoder_cfg['depth_mult'] = max(0.25, float(base_depth_mult) * scale)
+    base_expansion = encoder_cfg.get('expansion', 1.0)
+    encoder_cfg['expansion'] = max(0.25, float(base_expansion) * scale)
+    base_enc_layers = encoder_cfg.get('num_encoder_layers', 1)
+    encoder_cfg['num_encoder_layers'] = max(1, _scale_value(base_enc_layers, 1))
+
+    # Transformer decoder adjustments
+    decoder_cfg = cfg.setdefault('RTDETRTransformerv2', {})
+    dec_base_hidden = decoder_cfg.get('hidden_dim', 256)
+    dec_hidden = _scale_value(dec_base_hidden, 32)
+    decoder_cfg['hidden_dim'] = dec_hidden
+    dec_base_ff = decoder_cfg.get('dim_feedforward', 1024)
+    decoder_cfg['dim_feedforward'] = max(dec_hidden * 3, _scale_value(dec_base_ff, 96))
+    dec_base_heads = decoder_cfg.get('nhead', 8)
+    decoder_cfg['nhead'] = max(2, min(4, _find_divisor(dec_hidden, dec_base_heads)))
+    base_layers = decoder_cfg.get('num_layers', 6)
+    decoder_cfg['num_layers'] = max(1, min(4, _scale_value(base_layers, 1)))
+    base_points = decoder_cfg.get('num_points', 4)
+    if isinstance(base_points, (list, tuple)):
+        decoder_cfg['num_points'] = [max(1, min(3, int(round(p * scale)))) for p in base_points]
+    else:
+        decoder_cfg['num_points'] = max(1, min(3, _scale_value(base_points, 1)))
+    base_denoising = decoder_cfg.get('num_denoising', 100)
+    decoder_cfg['num_denoising'] = max(0, _scale_value(base_denoising, 0))
+    decoder_cfg['num_queries'] = 200
+
+    feat_channels = decoder_cfg.get('feat_channels')
+    if isinstance(feat_channels, list) and feat_channels:
+        decoder_cfg['feat_channels'] = [dec_hidden for _ in feat_channels]
+    else:
+        decoder_cfg['feat_channels'] = [dec_hidden] * 3
+
+    return cfg
 
 class YAMLConfig(BaseConfig):
     def __init__(self, cfg_path: str, **kwargs) -> None:
@@ -19,6 +92,7 @@ class YAMLConfig(BaseConfig):
 
         cfg = load_config(cfg_path)
         cfg = merge_dict(cfg, kwargs)
+        cfg = _apply_pruned_overrides(cfg)
 
         self.yaml_cfg = copy.deepcopy(cfg) 
         

@@ -8,13 +8,14 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
 
 from ...data.dataset.imagenet import ImageNetDataset
 from ...data.dataset.subset import limit_total
-from ..backbone.train_backbones import _move_to_device, build_resnet_transforms
+from ..backbone.train_backbones import _move_to_device, build_resnet_transforms, normalise_logits
 
 
 @dataclass
@@ -30,6 +31,10 @@ class BenchmarkResult:
     throughput_img_s: float
     peak_memory_mb: float | None
 
+    loss: float | None = None
+    acc1: float | None = None
+    acc5: float | None = None
+
     def as_dict(self) -> dict[str, float | int | None | tuple[int, ...]]:
         return {
             "samples": self.samples,
@@ -42,6 +47,9 @@ class BenchmarkResult:
             "mean_latency_ms": self.mean_latency_ms,
             "throughput_img_s": self.throughput_img_s,
             "peak_memory_mb": self.peak_memory_mb,
+            "loss": self.loss,
+            "acc1": self.acc1,
+            "acc5": self.acc5,
         }
 
 
@@ -55,27 +63,45 @@ def _build_active_index(coeff_window: int) -> torch.Tensor | None:
 def _prune_payload(
     payload: tuple[torch.Tensor, torch.Tensor],
     active_idx: torch.Tensor | None,
+    expected_channels: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if active_idx is None:
+    if active_idx is None or expected_channels >= 64:
         return payload
     y_blocks, cbcr_blocks = payload
+    if y_blocks.size(0) == expected_channels:
+        return y_blocks, cbcr_blocks
+    if y_blocks.size(0) <= 0 or cbcr_blocks.size(1) <= 0:
+        return y_blocks, cbcr_blocks
+
     idx = active_idx
-    y_pruned = torch.index_select(y_blocks, 0, idx)
-    cb_pruned = torch.index_select(cbcr_blocks[0], 0, idx)
-    cr_pruned = torch.index_select(cbcr_blocks[1], 0, idx)
-    cbcr_pruned = torch.stack((cb_pruned, cr_pruned), dim=0)
-    return y_pruned, cbcr_pruned
+    if idx.numel() == 0:
+        return y_blocks, cbcr_blocks
+
+    valid_mask = idx < y_blocks.size(0)
+    idx = idx[valid_mask]
+    if idx.numel() == 0:
+        return y_blocks, cbcr_blocks
+
+    device = y_blocks.device
+    mask = torch.zeros(y_blocks.size(0), dtype=y_blocks.dtype, device=device)
+    mask[idx.to(device=device)] = 1.0
+    mask_y = mask.view(-1, 1, 1)
+    mask_cbcr = mask.view(1, -1, 1, 1)
+    y_masked = y_blocks * mask_y
+    cbcr_masked = cbcr_blocks * mask_cbcr
+    return y_masked, cbcr_masked
 
 
 def _build_trimmed_collate_fn(coeff_window: int):
     active_idx = _build_active_index(coeff_window)
+    expected_channels = coeff_window * coeff_window
 
     def collate(batch: Iterable[tuple[tuple[torch.Tensor, torch.Tensor], int]]):
         y_list = []
         cbcr_list = []
         targets = []
         for payload, target in batch:
-            y_trimmed, cbcr_trimmed = _prune_payload(payload, active_idx)
+            y_trimmed, cbcr_trimmed = _prune_payload(payload, active_idx, expected_channels)
             y_list.append(y_trimmed)
             cbcr_list.append(cbcr_trimmed)
             targets.append(int(target))
@@ -97,6 +123,7 @@ def build_trimmed_eval_loader(
     max_samples: int | None,
     dct_normalizer: T.Transform | None,
     show_progress: bool,
+    trim_coefficients: bool,
 ) -> DataLoader:
     compression = dict(compression_cfg)
     compression.setdefault("keep_original", False)
@@ -106,6 +133,7 @@ def build_trimmed_eval_loader(
         image_size,
         compression=compression,
         dct_normalizer_val=dct_normalizer,
+        trim_coefficients=trim_coefficients,
     )
     dataset = ImageNetDataset(list(val_dirs), transforms=val_tf, show_progress=show_progress)
     if max_samples is not None and max_samples > 0:
@@ -169,6 +197,8 @@ def run_trimmed_inference_benchmark(
     warmup_batches: int,
     measure_batches: int,
     show_progress: bool = False,
+    collect_metrics: bool = False,
+    trim_coefficients: bool = False,
 ) -> BenchmarkResult | None:
     if measure_batches <= 0:
         return None
@@ -185,6 +215,7 @@ def run_trimmed_inference_benchmark(
         max_samples,
         dct_normalizer,
         show_progress,
+        trim_coefficients,
     )
     if len(loader) == 0:
         return None
@@ -205,12 +236,16 @@ def run_trimmed_inference_benchmark(
     input_bytes = 0
     luma_shape: tuple[int, int, int] | None = None
     chroma_shape: tuple[int, int, int, int] | None = None
+    metric_samples = 0
+    metric_loss = 0.0
+    metric_correct1 = 0.0
+    metric_correct5 = 0.0
 
     if is_cuda:
         torch.cuda.reset_peak_memory_stats(device)
 
     with torch.inference_mode(), _temporarily_patch_active_idx(backbone, coeff_window):
-        for batch_idx, (inputs, _) in enumerate(loader):
+        for batch_idx, (inputs, targets) in enumerate(loader):
             if batch_idx < warmup_batches:
                 _ = model(_move_to_device(inputs, device))
                 if is_cuda:
@@ -218,10 +253,14 @@ def run_trimmed_inference_benchmark(
                 continue
             if measured_batches >= measure_batches:
                 break
+            inputs_device = _move_to_device(inputs, device)
+            targets_device = targets.to(device=device) if collect_metrics else None
             if is_cuda:
                 torch.cuda.synchronize(device)
             start = time.perf_counter()
-            _ = model(_move_to_device(inputs, device))
+            outputs = model(inputs_device)
+            if collect_metrics:
+                outputs = normalise_logits(outputs)
             if is_cuda:
                 torch.cuda.synchronize(device)
             elapsed = time.perf_counter() - start
@@ -231,6 +270,17 @@ def run_trimmed_inference_benchmark(
             input_bytes += _estimate_bytes(batch_inputs)
             batch_size_actual = batch_inputs[0].size(0)
             total_samples += batch_size_actual
+            if collect_metrics and targets_device is not None:
+                metric_samples += targets_device.size(0)
+                metric_loss += float(
+                    F.cross_entropy(outputs, targets_device, reduction="sum").item()
+                )
+                maxk = min(5, outputs.size(1))
+                _, pred = outputs.topk(maxk, dim=1, largest=True, sorted=True)
+                pred = pred.t()
+                correct = pred.eq(targets_device.view(1, -1).expand_as(pred))
+                metric_correct1 += correct[:1].reshape(-1).float().sum().item()
+                metric_correct5 += correct[:5].reshape(-1).float().sum().item()
             if luma_shape is None:
                 y_tensor, cbcr_tensor = batch_inputs
                 luma_shape = tuple(int(v) for v in y_tensor.shape[1:])
@@ -246,6 +296,10 @@ def run_trimmed_inference_benchmark(
     if is_cuda:
         peak_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
+    mean_loss = metric_loss / metric_samples if metric_samples > 0 else None
+    mean_acc1 = metric_correct1 / metric_samples if metric_samples > 0 else None
+    mean_acc5 = metric_correct5 / metric_samples if metric_samples > 0 else None
+
     result = BenchmarkResult(
         samples=total_samples,
         measured_batches=measured_batches,
@@ -257,5 +311,8 @@ def run_trimmed_inference_benchmark(
         mean_latency_ms=avg_latency_ms,
         throughput_img_s=throughput,
         peak_memory_mb=peak_memory,
+        loss=mean_loss,
+        acc1=mean_acc1,
+        acc5=mean_acc5,
     )
     return result

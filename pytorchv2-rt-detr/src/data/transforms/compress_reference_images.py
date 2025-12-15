@@ -92,6 +92,13 @@ def _plane_to_blocks(dct_plane: np.ndarray) -> np.ndarray:
     return blocks
 
 
+def _build_active_index(coeff_window: int) -> np.ndarray | None:
+    if coeff_window >= 8:
+        return None
+    indices = [row + col * 8 for col in range(coeff_window) for row in range(coeff_window)]
+    return np.array(indices, dtype=np.int64)
+
+
 def _apply_frequency_window(blocks: np.ndarray, coeff_window: int) -> np.ndarray:
     """Zero out high-frequency coefficients outside a size×size window per block."""
     if coeff_window not in (1, 2, 4, 8):
@@ -336,6 +343,46 @@ class CompressToDCT(T.Transform):
         if target is None:
             return payload
         return payload, target
+
+
+class TrimDCTCoefficients(T.Transform):
+    """Reduce DCT payload depth to coeff_window² active coefficients."""
+
+    def __init__(self, coeff_window: int) -> None:
+        super().__init__()
+        if coeff_window not in (1, 2, 4, 8):
+            raise ValueError(f"Unsupported coeff_window: {coeff_window}")
+        self.coeff_window = coeff_window
+        active_idx = _build_active_index(coeff_window)
+        self.active_idx = active_idx
+
+    def _trim_pair(self, y_blocks: torch.Tensor, cbcr_blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.active_idx is None or y_blocks.size(0) <= self.coeff_window * self.coeff_window:
+            return y_blocks, cbcr_blocks
+        idx = torch.as_tensor(self.active_idx, dtype=torch.long, device=y_blocks.device)
+        y_trim = torch.index_select(y_blocks, 0, idx)
+        cb = torch.index_select(cbcr_blocks[0], 0, idx)
+        cr = torch.index_select(cbcr_blocks[1], 0, idx)
+        cbcr_trim = torch.stack((cb, cr), dim=0)
+        return y_trim, cbcr_trim
+
+    def _trim_payload(self, payload):
+        if isinstance(payload, tuple) and len(payload) == 2:
+            first, second = payload
+            if torch.is_tensor(first) and torch.is_tensor(second):
+                return self._trim_pair(first, second)
+            trimmed_first = self._trim_payload(first)
+            return trimmed_first, second
+        if isinstance(payload, tuple) and len(payload) > 2:
+            trimmed_first = self._trim_payload(payload[0])
+            return (trimmed_first, *payload[1:])
+        raise TypeError("TrimDCTCoefficients expects payloads produced by CompressToDCT")
+
+    def forward(self, inputs, target=None):
+        trimmed = self._trim_payload(inputs)
+        if target is None:
+            return trimmed
+        return trimmed, target
 
 
 def _save_result(result: dict[str, np.ndarray], output_dir: Path) -> Path:

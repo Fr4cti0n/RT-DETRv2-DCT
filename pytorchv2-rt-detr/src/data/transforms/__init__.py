@@ -18,5 +18,5 @@ from ._transforms import (
 )
 from .container import Compose
 from .mosaic import Mosaic
-from .compress_reference_images import CompressToDCT
+from .compress_reference_images import CompressToDCT, TrimDCTCoefficients
 from .dct_normalize import NormalizeDCTCoefficients, NormalizeDCTCoefficientsFromFile

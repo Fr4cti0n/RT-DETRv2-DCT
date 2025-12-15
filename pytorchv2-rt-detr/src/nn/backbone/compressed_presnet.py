@@ -213,7 +213,7 @@ class CompressedResNetBlockStem(_BackboneAdapter):
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
         cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx is not None:
+        if self.active_idx is not None and y_blocks.size(1) > self.luma_channels:
             idx = self.active_idx.to(device)
             y_blocks = torch.index_select(y_blocks, 1, idx)
             cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
@@ -270,7 +270,7 @@ class CompressedResNetLumaFusion(_BackboneAdapter):
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
         cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx is not None:
+        if self.active_idx is not None and y_blocks.size(1) > self.luma_channels:
             idx = self.active_idx.to(device)
             y_blocks = torch.index_select(y_blocks, 1, idx)
             cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
@@ -362,7 +362,7 @@ class CompressedResNetLumaFusionPruned(_BackboneAdapter):
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
         cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx is not None:
+        if self.active_idx is not None and y_blocks.size(1) > self.luma_channels:
             idx = self.active_idx.to(device)
             y_blocks = torch.index_select(y_blocks, 1, idx)
             cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
@@ -417,7 +417,15 @@ class CompressedPResNet(nn.Module):
             state = torch.load(compressed_pretrained, map_location="cpu")
             if isinstance(state, dict) and "model" in state:
                 state = state["model"]
-            missing, unexpected = self.backbone.load_state_dict(state, strict=strict_load)
+            filtered: dict[str, torch.Tensor] = {}
+            for key, value in state.items():
+                if not key.startswith("backbone"):
+                    continue
+                trimmed = key
+                while trimmed.startswith("backbone."):
+                    trimmed = trimmed[len("backbone.") :]
+                filtered[trimmed] = value
+            missing, unexpected = self.backbone.load_state_dict(filtered, strict=strict_load)
             if missing or unexpected:
                 print(
                     "Warning: loading compressed backbone weights, "

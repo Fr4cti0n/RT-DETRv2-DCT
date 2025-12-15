@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from ...data.dataset.imagenet import ImageNetDataset
 from ...data.dataset.subset import limit_per_class, limit_total
-from ...data.transforms.compress_reference_images import CompressToDCT
+from ...data.transforms.compress_reference_images import CompressToDCT, TrimDCTCoefficients
 from ..arch.classification import Classification, ClassHead
 from .presnet import PResNet
 from .compressed_presnet import build_compressed_backbone
@@ -207,6 +207,7 @@ def build_resnet_transforms(
     augmentation_overrides: Optional[Dict[str, object]] = None,
     dct_normalizer_train: Optional[T.Transform] = None,
     dct_normalizer_val: Optional[T.Transform] = None,
+    trim_coefficients: bool = False,
 ) -> Tuple[T.Transform, T.Transform]:
     image_size = _ensure_multiple_of(image_size, 8)
     crop_scale = _resolve_crop_scale(augmentation_overrides, (0.08, 1.0))
@@ -234,11 +235,17 @@ def build_resnet_transforms(
         ])
     else:
         train_ops.append(T.ToDtype(torch.float32, scale=True))
+        trim_coeffs = bool(trim_coefficients)
+        coeff_window = int(compression.get("coeff_window", 8))
         train_ops.append(CompressToDCT(**compression))
+        if trim_coeffs and coeff_window < 8:
+            train_ops.append(TrimDCTCoefficients(coeff_window))
         if dct_normalizer_train is not None:
             train_ops.append(dct_normalizer_train)
         val_ops.append(T.ToDtype(torch.float32, scale=True))
         val_ops.append(CompressToDCT(**compression))
+        if trim_coeffs and coeff_window < 8:
+            val_ops.append(TrimDCTCoefficients(coeff_window))
         if dct_normalizer_val is not None:
             val_ops.append(dct_normalizer_val)
 

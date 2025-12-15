@@ -26,7 +26,7 @@ CompressedPResNet:
   strict_load: False
 
 HybridEncoder:
-  in_channels: [128, 256, 512]
+  in_channels: [64, 128, 256]
   hidden_dim: 256
   expansion: 0.5
 
@@ -73,6 +73,7 @@ train_dataloader:
         ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
   collate_fn:
     scales: ~
+  total_batch_size: 16
 
 val_dataloader:
   dataset:

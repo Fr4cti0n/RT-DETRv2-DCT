@@ -79,16 +79,29 @@ class NormalizeDCTCoefficients(T.Transform):
         y_blocks: torch.Tensor,
         cbcr_blocks: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        mean_luma = self.mean_luma.to(device=y_blocks.device, dtype=y_blocks.dtype)
-        std_luma = self.std_luma.to(device=y_blocks.device, dtype=y_blocks.dtype)
+        channels_luma = int(y_blocks.shape[-3])
+        mean_luma_full = self.mean_luma.to(device=y_blocks.device, dtype=y_blocks.dtype)
+        std_luma_full = self.std_luma.to(device=y_blocks.device, dtype=y_blocks.dtype)
+        mean_luma = mean_luma_full[:channels_luma]
+        std_luma = std_luma_full[:channels_luma]
+        if y_blocks.dim() > 3:
+            mean_luma = mean_luma.unsqueeze(0)
+            std_luma = std_luma.unsqueeze(0)
         norm_y = (y_blocks - mean_luma) / (std_luma + self.eps)
-        mask_luma = self.mask_luma.to(device=y_blocks.device, dtype=y_blocks.dtype)
+        mask_luma_full = self.mask_luma.to(device=y_blocks.device, dtype=y_blocks.dtype)
+        mask_luma = mask_luma_full[:channels_luma]
+        if y_blocks.dim() > 3:
+            mask_luma = mask_luma.unsqueeze(0)
         y_norm = mask_luma * norm_y + (1.0 - mask_luma) * y_blocks
 
-        mean_chroma = self.mean_chroma.to(device=cbcr_blocks.device, dtype=cbcr_blocks.dtype)
-        std_chroma = self.std_chroma.to(device=cbcr_blocks.device, dtype=cbcr_blocks.dtype)
+        channels_chroma = int(cbcr_blocks.shape[-3])
+        mean_chroma_full = self.mean_chroma.to(device=cbcr_blocks.device, dtype=cbcr_blocks.dtype)
+        std_chroma_full = self.std_chroma.to(device=cbcr_blocks.device, dtype=cbcr_blocks.dtype)
+        mean_chroma = mean_chroma_full[:, :channels_chroma]
+        std_chroma = std_chroma_full[:, :channels_chroma]
         norm_cbcr = (cbcr_blocks - mean_chroma) / (std_chroma + self.eps)
-        mask_chroma = self.mask_chroma.to(device=cbcr_blocks.device, dtype=cbcr_blocks.dtype)
+        mask_chroma_full = self.mask_chroma.to(device=cbcr_blocks.device, dtype=cbcr_blocks.dtype)
+        mask_chroma = mask_chroma_full[:, :channels_chroma]
         cbcr_norm = mask_chroma * norm_cbcr + (1.0 - mask_chroma) * cbcr_blocks
         return y_norm, cbcr_norm
 

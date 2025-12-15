@@ -15,6 +15,11 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
+
 from ...data.dataset.imagenet import ImageNetDataset
 from ...data.dataset.subset import limit_total
 from ...data.transforms.dct_normalize import NormalizeDCTCoefficients
@@ -42,6 +47,27 @@ _NUM_CLASSES = 1000
 _LR_REFERENCE_BATCH = 512
 _LR_CAP = 0.1
 
+_PRINTED_INPUT_SHAPES = {"train": False, "eval": False}
+_WARNED_NO_TQDM = False
+
+
+def _describe_tensor(tensor: torch.Tensor) -> str:
+    shape = "x".join(str(dim) for dim in tensor.shape)
+    return f"Tensor[{shape}]({tensor.dtype})"
+
+
+def _describe_inputs(nested) -> str:
+    if torch.is_tensor(nested):
+        return _describe_tensor(nested)
+    if isinstance(nested, (list, tuple)):
+        inner = ", ".join(_describe_inputs(item) for item in nested)
+        bracket_open, bracket_close = ("(", ")") if isinstance(nested, tuple) else ("[", "]")
+        return f"{bracket_open}{inner}{bracket_close}"
+    if isinstance(nested, dict):
+        items = ", ".join(f"{key}: {_describe_inputs(value)}" for key, value in nested.items())
+        return f"{{{items}}}"
+    return repr(type(nested))
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -61,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=0,
                         help="Number of linear warmup epochs applied before cosine decay.")
     parser.add_argument("--coeff-window", type=int, choices=[1, 2, 4, 8], default=4)
+    parser.add_argument("--trim-coefficients", action=argparse.BooleanOptionalAction, default=True,
+                        help="Reduce DCT payload depth to coeff_window^2 channels (use --no-trim-coefficients to keep 64).")
     parser.add_argument("--range-mode", choices=["studio", "full"], default="studio")
     parser.add_argument(
         "--variant",
@@ -113,6 +141,8 @@ def parse_args() -> argparse.Namespace:
                         help="Maximum wall-clock time for training (hours, 0 disables the limit).")
     parser.add_argument("--benchmark", dest="benchmark_enabled", action=argparse.BooleanOptionalAction, default=True,
                         help="Run trimmed-input inference benchmarking after training (use --no-benchmark to skip).")
+    parser.add_argument("--benchmark-validate", action=argparse.BooleanOptionalAction, default=False,
+                        help="Collect top-1/top-5 accuracy and loss during benchmarking (use --no-benchmark-validate to skip metrics).")
     parser.add_argument("--benchmark-disable", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--benchmark-max-samples", type=int, default=128,
                         help="Maximum validation samples used during trimmed-input benchmarking (default: 128).")
@@ -124,12 +154,21 @@ def parse_args() -> argparse.Namespace:
                         help="Number of workers for trimmed-input benchmarking (default: 2).")
     parser.add_argument("--trimmed-val-disable", action="store_true",
                         help="Skip accuracy evaluation using the trimmed-input dataloader.")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Skip training and only run validation/benchmarking (requires --resume for pretrained weights).")
     args = parser.parse_args()
     if getattr(args, "benchmark_disable", False):
         print("[cli] --benchmark-disable is deprecated; use --no-benchmark instead.")
         args.benchmark_enabled = False
     if not hasattr(args, "benchmark_enabled"):
         args.benchmark_enabled = True
+    if not hasattr(args, "benchmark_validate"):
+        args.benchmark_validate = False
+    if not args.benchmark_enabled:
+        args.benchmark_validate = False
+    if args.variant == "reconstruction" and args.trim_coefficients:
+        print("[cli] Reconstruction variant requires full coefficient depth; disabling coefficient trimming.")
+        args.trim_coefficients = False
     return args
 
 
@@ -145,12 +184,14 @@ def build_dataloaders(
     max_val: int | None,
     dct_normalizer_train: T.Transform | None = None,
     dct_normalizer_val: T.Transform | None = None,
+    trim_coefficients: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     train_tf, val_tf = build_resnet_transforms(
         image_size,
         compression=compression_cfg,
         dct_normalizer_train=dct_normalizer_train,
         dct_normalizer_val=dct_normalizer_val,
+        trim_coefficients=trim_coefficients,
     )
     train_set = ImageNetDataset(train_dirs, transforms=train_tf, show_progress=show_progress)
     val_set = ImageNetDataset([val_dir], transforms=val_tf, show_progress=show_progress)
@@ -287,6 +328,9 @@ def train_one_epoch(
             time_limit_reached = True
             break
         inputs = _move_to_device(inputs, device)
+        if not _PRINTED_INPUT_SHAPES["train"]:
+            print(f"[inputs][train] { _describe_inputs(inputs) }")
+            _PRINTED_INPUT_SHAPES["train"] = True
         targets = targets.to(device)
         optimizer.zero_grad()
         if use_amp and device.type == "cuda":
@@ -348,15 +392,36 @@ def train_one_epoch(
     }
 
 
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> dict[str, float]:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> dict[str, float]:
     model.eval()
     running_loss = 0.0
     correct1 = 0
     correct5 = 0
     total = 0
+    iterator = loader
+    progress = None
+    global _WARNED_NO_TQDM
+    if show_progress:
+        if tqdm is not None:
+            progress = tqdm(loader, desc=progress_desc or "eval", leave=False)
+            iterator = progress
+        else:
+            if not _WARNED_NO_TQDM:
+                print("[eval] tqdm not installed; proceeding without progress bar.")
+                _WARNED_NO_TQDM = True
     with torch.no_grad():
-        for inputs, targets in loader:
+        for inputs, targets in iterator:
             inputs = _move_to_device(inputs, device)
+            if not _PRINTED_INPUT_SHAPES["eval"]:
+                print(f"[inputs][eval] { _describe_inputs(inputs) }")
+                _PRINTED_INPUT_SHAPES["eval"] = True
             targets = targets.to(device)
             outputs = normalise_logits(model(inputs))
             loss = criterion(outputs, targets)
@@ -368,6 +433,8 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
             correct1 += correct_matrix[:1].reshape(-1).float().sum().item()
             correct5 += correct_matrix[:5].reshape(-1).float().sum().item()
             total += targets.size(0)
+    if progress is not None:
+        progress.close()
     return {
         "loss": running_loss / max(total, 1),
         "acc1": correct1 / max(total, 1),
@@ -436,6 +503,7 @@ def main() -> None:
         args.max_val_images,
         normalizer_train,
         normalizer_val,
+        trim_coefficients=args.trim_coefficients,
     )
 
     effective_lr = args.lr * args.batch_size / _LR_REFERENCE_BATCH
@@ -465,6 +533,7 @@ def main() -> None:
         wandb_config = {
             "variant": args.variant,
             "coeff_window": args.coeff_window,
+            "trim_coefficients": args.trim_coefficients,
             "range_mode": args.range_mode,
             "image_size": args.image_size,
             "batch_size": args.batch_size,
@@ -540,10 +609,12 @@ def main() -> None:
         output_dir = base_output_dir / run_subdir_name
         checkpoint_dir = base_checkpoint_dir / run_subdir_name
 
+    checkpoint_root = checkpoint_dir.resolve()
+    print(f"[setup] checkpoints -> {checkpoint_root}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = checkpoint_dir / "training_params.csv"
     best_acc = 0.0
     start_epoch = 1
 
@@ -568,54 +639,57 @@ def main() -> None:
         last_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = last_epoch + 1
         print(f"Resumed training from epoch {last_epoch} with best acc@1={best_acc:.4f} ({resume_path})")
-        if start_epoch > args.epochs:
+        if start_epoch > args.epochs and not args.eval_only:
             print("Checkpoint epoch exceeds requested total epochs; nothing to train.")
             if wandb_run is not None:
                 wandb_run.finish()
             return
 
-    timestamp_now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    params_to_record = {
-        "variant": args.variant,
-        "coeff_window": args.coeff_window,
-        "range_mode": args.range_mode,
-        "image_size": args.image_size,
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "start_epoch": start_epoch,
-        "lr": args.lr,
-        "effective_lr": effective_lr,
-        "lr_milestones": " ".join(str(m) for m in milestones),
-        "lr_gamma": args.lr_gamma,
-        "warmup_epochs": warmup_epochs,
-        "momentum": args.momentum,
-        "weight_decay": args.weight_decay,
-        "eta_min": args.eta_min,
-        "train_samples": len(train_loader.dataset),
-        "val_samples": len(val_loader.dataset),
-        "seed": args.seed,
-        "train_dirs": ";".join(str(p) for p in args.train_dirs),
-        "val_dir": str(args.val_dir),
-        "channels_last": args.channels_last,
-        "dct_stats_path": str(stats_path_resolved) if stats_path_resolved is not None else "",
-        "time_limit_hours": time_limit_hours if time_limit_hours is not None else "none",
-        "output_dir": str(output_dir),
-        "checkpoint_dir": str(checkpoint_dir),
-        "resume_checkpoint": str(resume_path) if resume_path is not None else "",
-        "timestamp": timestamp_now,
-    }
-    csv_exists = csv_path.exists()
-    with csv_path.open("a" if csv_exists else "w", newline="") as csv_file:
-        writer = csv.writer(csv_file)
-        if not csv_exists:
-            writer.writerow(["parameter", "value"])
-            for key, value in params_to_record.items():
-                writer.writerow([key, value])
-        else:
-            writer.writerow(["resume_timestamp", timestamp_now])
-            writer.writerow(["resume_start_epoch", start_epoch])
-            if resume_path is not None:
-                writer.writerow(["resume_checkpoint", str(resume_path)])
+    if not args.eval_only:
+        csv_path = checkpoint_dir / "training_params.csv"
+        timestamp_now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        params_to_record = {
+            "variant": args.variant,
+            "coeff_window": args.coeff_window,
+            "range_mode": args.range_mode,
+            "trim_coefficients": args.trim_coefficients,
+            "image_size": args.image_size,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "start_epoch": start_epoch,
+            "lr": args.lr,
+            "effective_lr": effective_lr,
+            "lr_milestones": " ".join(str(m) for m in milestones),
+            "lr_gamma": args.lr_gamma,
+            "warmup_epochs": warmup_epochs,
+            "momentum": args.momentum,
+            "weight_decay": args.weight_decay,
+            "eta_min": args.eta_min,
+            "train_samples": len(train_loader.dataset),
+            "val_samples": len(val_loader.dataset),
+            "seed": args.seed,
+            "train_dirs": ";".join(str(p) for p in args.train_dirs),
+            "val_dir": str(args.val_dir),
+            "channels_last": args.channels_last,
+            "dct_stats_path": str(stats_path_resolved) if stats_path_resolved is not None else "",
+            "time_limit_hours": time_limit_hours if time_limit_hours is not None else "none",
+            "output_dir": str(output_dir),
+            "checkpoint_dir": str(checkpoint_dir),
+            "resume_checkpoint": str(resume_path) if resume_path is not None else "",
+            "timestamp": timestamp_now,
+        }
+        csv_exists = csv_path.exists()
+        with csv_path.open("a" if csv_exists else "w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            if not csv_exists:
+                writer.writerow(["parameter", "value"])
+                for key, value in params_to_record.items():
+                    writer.writerow([key, value])
+            else:
+                writer.writerow(["resume_timestamp", timestamp_now])
+                writer.writerow(["resume_start_epoch", start_epoch])
+                if resume_path is not None:
+                    writer.writerow(["resume_checkpoint", str(resume_path)])
 
     run_start_time = time.time()
 
@@ -633,48 +707,100 @@ def main() -> None:
                 wandb_run.finish()
             return
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        if time_limit_seconds and time.time() - run_start_time >= time_limit_seconds:
-            print("Time limit reached before starting new epoch; stopping training loop.")
-            time_limit_triggered = True
-            break
-        print(f"Epoch {epoch}/{args.epochs}")
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-        warmup_active = False
-        warmup_factor = 1.0
-        if warmup_epochs > 0:
-            warmup_idx = epoch - 1
-            if warmup_idx < warmup_epochs:
-                warmup_active = True
-                warmup_factor = (warmup_idx + 1) / warmup_epochs
-                warmup_lr = effective_lr * warmup_factor
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = warmup_lr
-        stats = train_one_epoch(
+    last_val_stats: dict[str, float] | None = None
+
+    if args.eval_only:
+        print("[eval-only] Skipping training; running validation.")
+        last_val_stats = evaluate(
             model,
-            train_loader,
-            optimizer,
+            val_loader,
             criterion,
             device,
-            epoch,
-            args.epochs,
-            run_start_time,
-            use_amp=args.amp,
-            scaler=scaler,
-            print_freq=args.print_freq,
-            time_limit_seconds=time_limit_seconds,
+            show_progress=True,
+            progress_desc="val",
         )
-        if stats.get("time_limit_reached"):
-            print("Time limit reached during training phase; terminating without evaluation.")
-            time_limit_triggered = True
-            break
-        val_stats = evaluate(model, val_loader, criterion, device)
-        if time_limit_seconds and time.time() - run_start_time >= time_limit_seconds:
-            print("Time limit reached after evaluation; stopping training loop.")
-            time_limit_triggered = True
+        if last_val_stats is not None:
+            print(
+                "  val loss={loss:.4f} acc@1={acc1:.4f} acc@5={acc5:.4f}".format(
+                    loss=last_val_stats["loss"],
+                    acc1=last_val_stats["acc1"],
+                    acc5=last_val_stats["acc5"],
+                )
+            )
+            best_acc = max(best_acc, last_val_stats["acc1"])
+            if wandb_run is not None:
+                wandb_run.log({
+                    "val/loss": last_val_stats["loss"],
+                    "val/acc1": last_val_stats["acc1"],
+                    "val/acc5": last_val_stats["acc5"],
+                })
+    else:
+        for epoch in range(start_epoch, args.epochs + 1):
+            if time_limit_seconds and time.time() - run_start_time >= time_limit_seconds:
+                print("Time limit reached before starting new epoch; stopping training loop.")
+                time_limit_triggered = True
+                break
+            print(f"Epoch {epoch}/{args.epochs}")
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            warmup_active = False
+            warmup_factor = 1.0
+            if warmup_epochs > 0:
+                warmup_idx = epoch - 1
+                if warmup_idx < warmup_epochs:
+                    warmup_active = True
+                    warmup_factor = (warmup_idx + 1) / warmup_epochs
+                    warmup_lr = effective_lr * warmup_factor
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = warmup_lr
+            stats = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                epoch,
+                args.epochs,
+                run_start_time,
+                use_amp=args.amp,
+                scaler=scaler,
+                print_freq=args.print_freq,
+                time_limit_seconds=time_limit_seconds,
+            )
+            if stats.get("time_limit_reached"):
+                print("Time limit reached during training phase; terminating without evaluation.")
+                time_limit_triggered = True
+                break
+            val_stats = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                show_progress=True,
+                progress_desc=f"val epoch {epoch}",
+            )
+            last_val_stats = val_stats
+            if time_limit_seconds and time.time() - run_start_time >= time_limit_seconds:
+                print("Time limit reached after evaluation; stopping training loop.")
+                time_limit_triggered = True
+                current_lr = optimizer.param_groups[0]["lr"]
+                next_lr = current_lr
+                acc1 = val_stats["acc1"]
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    gpu_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                else:
+                    gpu_mem = None
+                print(
+                    f"  train loss={stats['loss']:.4f} acc@1={stats['acc1']:.4f} acc@5={stats['acc5']:.4f} | "
+                    f"val loss={val_stats['loss']:.4f} acc@1={val_stats['acc1']:.4f} acc@5={val_stats['acc5']:.4f}"
+                    + (f" gpu_mem={gpu_mem:.1f}MB" if gpu_mem is not None else "")
+                )
+                break
             current_lr = optimizer.param_groups[0]["lr"]
-            next_lr = current_lr
+            if not warmup_active:
+                scheduler.step()
+            next_lr = optimizer.param_groups[0]["lr"]
             acc1 = val_stats["acc1"]
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -686,43 +812,43 @@ def main() -> None:
                 f"val loss={val_stats['loss']:.4f} acc@1={val_stats['acc1']:.4f} acc@5={val_stats['acc5']:.4f}"
                 + (f" gpu_mem={gpu_mem:.1f}MB" if gpu_mem is not None else "")
             )
-            break
-        current_lr = optimizer.param_groups[0]["lr"]
-        if not warmup_active:
-            scheduler.step()
-        next_lr = optimizer.param_groups[0]["lr"]
-        acc1 = val_stats["acc1"]
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-            gpu_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-        else:
-            gpu_mem = None
-        print(
-            f"  train loss={stats['loss']:.4f} acc@1={stats['acc1']:.4f} acc@5={stats['acc5']:.4f} | "
-            f"val loss={val_stats['loss']:.4f} acc@1={val_stats['acc1']:.4f} acc@5={val_stats['acc5']:.4f}"
-            + (f" gpu_mem={gpu_mem:.1f}MB" if gpu_mem is not None else "")
-        )
-        if wandb_run is not None:
-            wandb.log({
-                "epoch": epoch,
-                "train/loss": stats["loss"],
-                "train/acc1": stats["acc1"],
-                "train/acc5": stats["acc5"],
-                "val/loss": val_stats["loss"],
-                "val/acc1": val_stats["acc1"],
-                "val/acc5": val_stats["acc5"],
-                "lr": current_lr,
-                "lr_next": next_lr,
-                "warmup_factor": warmup_factor,
-                **({"gpu/peak_mem_mb": gpu_mem} if gpu_mem is not None else {}),
-            })
-        if acc1 > best_acc:
-            best_acc = acc1
             if wandb_run is not None:
-                wandb_run.summary["best/acc1"] = best_acc
-                wandb_run.summary["best/acc5"] = val_stats["acc5"]
-                wandb_run.summary["best/epoch"] = epoch
-            if args.save_best:
+                wandb.log({
+                    "epoch": epoch,
+                    "train/loss": stats["loss"],
+                    "train/acc1": stats["acc1"],
+                    "train/acc5": stats["acc5"],
+                    "val/loss": val_stats["loss"],
+                    "val/acc1": val_stats["acc1"],
+                    "val/acc5": val_stats["acc5"],
+                    "lr": current_lr,
+                    "lr_next": next_lr,
+                    "warmup_factor": warmup_factor,
+                    **({"gpu/peak_mem_mb": gpu_mem} if gpu_mem is not None else {}),
+                })
+            if acc1 > best_acc:
+                best_acc = acc1
+                if wandb_run is not None:
+                    wandb_run.summary["best/acc1"] = best_acc
+                    wandb_run.summary["best/acc5"] = val_stats["acc5"]
+                    wandb_run.summary["best/epoch"] = epoch
+                if args.save_best:
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(),
+                            "scaler": scaler.state_dict() if scaler is not None else None,
+                            "variant": args.variant,
+                            "coeff_window": args.coeff_window,
+                            "range_mode": args.range_mode,
+                            "best_acc": best_acc,
+                        },
+                        checkpoint_dir / "model_best.pth",
+                    )
+                    print(f"  Saved new best checkpoint acc@1={best_acc:.4f}")
+            if args.save_last:
                 torch.save(
                     {
                         "epoch": epoch,
@@ -735,39 +861,23 @@ def main() -> None:
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
                     },
-                    checkpoint_dir / "model_best.pth",
+                    checkpoint_dir / "checkpoint_last.pth",
                 )
-                print(f"  Saved new best checkpoint acc@1={best_acc:.4f}")
-        if args.save_last:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict() if scaler is not None else None,
-                    "variant": args.variant,
-                    "coeff_window": args.coeff_window,
-                    "range_mode": args.range_mode,
-                    "best_acc": best_acc,
-                },
-                checkpoint_dir / "checkpoint_last.pth",
-            )
-        if args.save_every and epoch % args.save_every == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict() if scaler is not None else None,
-                    "variant": args.variant,
-                    "coeff_window": args.coeff_window,
-                    "range_mode": args.range_mode,
-                    "best_acc": best_acc,
-                },
-                checkpoint_dir / f"checkpoint_{epoch:04d}.pth",
-            )
+            if args.save_every and epoch % args.save_every == 0:
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict() if scaler is not None else None,
+                        "variant": args.variant,
+                        "coeff_window": args.coeff_window,
+                        "range_mode": args.range_mode,
+                        "best_acc": best_acc,
+                    },
+                    checkpoint_dir / f"checkpoint_{epoch:04d}.pth",
+                )
 
     trimmed_val_stats: dict[str, float] | None = None
     if not args.trimmed_val_disable:
@@ -782,11 +892,19 @@ def main() -> None:
                 max_samples=args.max_val_images,
                 dct_normalizer=normalizer_val,
                 show_progress=args.show_progress,
+                trim_coefficients=args.trim_coefficients,
             )
             if len(trimmed_loader) == 0:
                 print("[trimmed-val] Validation dataset is empty; skipping trimmed evaluation.")
             else:
-                trimmed_val_stats = evaluate(model, trimmed_loader, criterion, device)
+                trimmed_val_stats = evaluate(
+                    model,
+                    trimmed_loader,
+                    criterion,
+                    device,
+                    show_progress=True,
+                    progress_desc="trimmed-val",
+                )
         except Exception as exc:  # pragma: no cover - trimmed validation is best-effort
             print(f"[trimmed-val] Failed to evaluate trimmed dataloader: {exc}")
 
@@ -812,6 +930,8 @@ def main() -> None:
                     warmup_batches=max(0, args.benchmark_warmup_batches),
                     measure_batches=max(0, args.benchmark_measure_batches),
                     show_progress=args.show_progress,
+                    collect_metrics=args.benchmark_validate,
+                    trim_coefficients=args.trim_coefficients,
                 )
             except Exception as exc:  # pragma: no cover - benchmark is best-effort
                 print(f"[benchmark] Failed for batch size {bench_bs}: {exc}")
@@ -831,9 +951,12 @@ def main() -> None:
                     "input_mb_per_batch": result.input_mb_per_batch,
                     "peak_memory_mb": result.peak_memory_mb,
                     "coeff_channels": result.coeff_channels,
+                    "val_loss": result.loss if result.loss is not None else "",
+                    "val_acc1": result.acc1 if result.acc1 is not None else "",
+                    "val_acc5": result.acc5 if result.acc5 is not None else "",
                 })
 
-    if benchmark_csv_rows:
+    if benchmark_csv_rows and not args.eval_only:
         benchmark_csv_path = checkpoint_dir / "benchmark_metrics.csv"
         csv_exists = benchmark_csv_path.exists()
         fieldnames = [
@@ -849,6 +972,9 @@ def main() -> None:
             "input_mb_per_batch",
             "peak_memory_mb",
             "coeff_channels",
+            "val_loss",
+            "val_acc1",
+            "val_acc5",
         ]
         with benchmark_csv_path.open("a" if csv_exists else "w", newline="") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -856,6 +982,8 @@ def main() -> None:
                 writer.writeheader()
             for row in benchmark_csv_rows:
                 writer.writerow(row)
+    elif benchmark_csv_rows and args.eval_only:
+        print("[benchmark] Skipping CSV write in eval-only mode (read-only checkpoint directory).")
 
     if trimmed_val_stats is not None:
         print(
@@ -878,13 +1006,20 @@ def main() -> None:
             if benchmark_result.peak_memory_mb is not None
             else ""
         )
+        metrics_text = ""
+        if benchmark_result.acc1 is not None and benchmark_result.acc5 is not None:
+            metrics_text = (
+                f" | acc@1={benchmark_result.acc1:.4f} acc@5={benchmark_result.acc5:.4f}"
+            )
+        if benchmark_result.loss is not None:
+            metrics_text += f" | loss={benchmark_result.loss:.4f}"
         print(
             f"[benchmark] trimmed inference (bs={batch_size}): "
             f"{benchmark_result.throughput_img_s:.2f} img/s | "
             f"{benchmark_result.mean_latency_ms:.2f} ms/batch | "
             f"coeffs={benchmark_result.coeff_channels} | "
             f"input={benchmark_result.input_mb_per_batch:.2f} MB/batch"
-            f"{peak_text}"
+            f"{peak_text}{metrics_text}"
         )
         if wandb_run is not None:
             wandb_run.summary.update({
@@ -895,11 +1030,32 @@ def main() -> None:
                 f"benchmark/bs{batch_size}/input_mb_per_batch": benchmark_result.input_mb_per_batch,
                 f"benchmark/bs{batch_size}/coeff_channels": benchmark_result.coeff_channels,
                 f"benchmark/bs{batch_size}/peak_memory_mb": benchmark_result.peak_memory_mb,
+                f"benchmark/bs{batch_size}/val_loss": benchmark_result.loss,
+                f"benchmark/bs{batch_size}/val_acc1": benchmark_result.acc1,
+                f"benchmark/bs{batch_size}/val_acc5": benchmark_result.acc5,
             })
 
-    print(f"Training complete. Best val acc@1={best_acc:.4f}")
-    if time_limit_triggered:
-        print("Stopped early due to the configured time limit.")
+    if args.eval_only:
+        if last_val_stats is not None:
+            print(
+                "Evaluation complete. val acc@1={acc1:.4f} acc@5={acc5:.4f} loss={loss:.4f}".format(
+                    acc1=last_val_stats["acc1"],
+                    acc5=last_val_stats["acc5"],
+                    loss=last_val_stats["loss"],
+                )
+            )
+            if wandb_run is not None:
+                wandb_run.summary.update({
+                    "val/acc1": last_val_stats["acc1"],
+                    "val/acc5": last_val_stats["acc5"],
+                    "val/loss": last_val_stats["loss"],
+                })
+        else:
+            print("Evaluation complete.")
+    else:
+        print(f"Training complete. Best val acc@1={best_acc:.4f}")
+        if time_limit_triggered:
+            print("Stopped early due to the configured time limit.")
     if wandb_run is not None:
         wandb_run.finish()
 
