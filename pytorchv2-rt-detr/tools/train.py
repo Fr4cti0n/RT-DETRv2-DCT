@@ -51,6 +51,12 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir', type=str, help='output directoy')
     parser.add_argument('--summary-dir', type=str, help='tensorboard summry')
     parser.add_argument('--test-only', action='store_true', default=False,)
+    parser.add_argument('--wandb', action=argparse.BooleanOptionalAction, default=None,
+                        help='Enable Weights & Biases logging (requires wandb)')
+    parser.add_argument('--wandb-project', type=str, help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, help='Weights & Biases entity/team')
+    parser.add_argument('--wandb-run-name', type=str, help='Weights & Biases run name')
+    parser.add_argument('--wandb-tags', nargs='*', help='Optional list of Weights & Biases tags')
 
     # priority 1
     parser.add_argument('-u', '--update', nargs='+', help='update yaml config')

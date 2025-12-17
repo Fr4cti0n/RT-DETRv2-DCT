@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import random
+import shutil
 import time
 from pathlib import Path
 
@@ -525,45 +526,14 @@ def main() -> None:
         print(f"Enforcing wall-clock time limit of {time_limit_hours:.2f}h.")
     time_limit_seconds = time_limit_hours * 3600.0 if time_limit_hours is not None else None
 
-    if args.wandb:
-        if wandb is None:
-            raise RuntimeError(
-                "Weights & Biases is not installed. Run 'pip install wandb' to enable logging."
-            )
-        wandb_config = {
-            "variant": args.variant,
-            "coeff_window": args.coeff_window,
-            "trim_coefficients": args.trim_coefficients,
-            "range_mode": args.range_mode,
-            "image_size": args.image_size,
-            "batch_size": args.batch_size,
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "lr_effective": effective_lr,
-            "lr_reference_batch": _LR_REFERENCE_BATCH,
-            "lr_cap": _LR_CAP,
-            "warmup_epochs": warmup_epochs,
-            "momentum": args.momentum,
-            "weight_decay": args.weight_decay,
-            "eta_min": args.eta_min,
-            "train_samples": len(train_loader.dataset),
-            "val_samples": len(val_loader.dataset),
-            "seed": args.seed,
-            "train_dirs": [str(p) for p in args.train_dirs],
-            "val_dir": str(args.val_dir),
-            "channels_last": args.channels_last,
-            "dct_stats_path": str(stats_path_resolved) if stats_path_resolved is not None else None,
-            "time_limit_hours": time_limit_hours,
-        }
-        default_name = f"{args.variant}_{args.coeff_window}"
-        run_name = args.wandb_run_name or default_name
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity or None,
-            name=run_name,
-            tags=args.wandb_tags,
-            config=wandb_config,
-        )
+    timestamp_tag = time.strftime("%Y%m%d-%H%M%S")
+    proposed_run_subdir = f"{args.variant}_coeff{args.coeff_window}_{timestamp_tag}"
+    run_subdir_name = proposed_run_subdir
+    if args.resume is not None:
+        resume_hint = args.resume.expanduser()
+        run_subdir_name = resume_hint.name if resume_hint.is_dir() else resume_hint.parent.name
+
+    wandb_run = None
 
     model, _ = build_model("resnet34", _NUM_CLASSES)
     model.apply(kaiming_initialisation)
@@ -593,9 +563,11 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
-    run_subdir_name = f"{args.variant}_coeff{args.coeff_window}"
     base_output_dir = args.output_dir
     base_checkpoint_dir = args.checkpoint_dir or base_output_dir
+
+    using_existing_run_dir = False
+    auto_resume_source_checkpoint: Path | None = None
 
     resume_path: Path | None = None
     if args.resume is not None:
@@ -605,15 +577,10 @@ def main() -> None:
         resume_dir = resume_path.parent
         output_dir = resume_dir
         checkpoint_dir = resume_dir
+        using_existing_run_dir = True
     else:
         output_dir = base_output_dir / run_subdir_name
         checkpoint_dir = base_checkpoint_dir / run_subdir_name
-
-    checkpoint_root = checkpoint_dir.resolve()
-    print(f"[setup] checkpoints -> {checkpoint_root}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     best_acc = 0.0
     start_epoch = 1
@@ -622,6 +589,29 @@ def main() -> None:
         candidate = checkpoint_dir / "checkpoint_last.pth"
         if candidate.exists():
             resume_path = candidate
+            auto_resume_source_checkpoint = candidate
+            using_existing_run_dir = True
+        else:
+            prefix = f"{args.variant}_coeff{args.coeff_window}_"
+            existing_dirs: list[Path] = []
+            if base_checkpoint_dir.exists():
+                existing_dirs = sorted(
+                    (
+                        path
+                        for path in base_checkpoint_dir.iterdir()
+                        if path.is_dir() and path.name.startswith(prefix)
+                    ),
+                    key=lambda path: path.name,
+                    reverse=True,
+                )
+            for run_dir in existing_dirs:
+                if run_dir == checkpoint_dir:
+                    continue
+                candidate = run_dir / "checkpoint_last.pth"
+                if candidate.exists():
+                    resume_path = candidate
+                    auto_resume_source_checkpoint = candidate
+                    break
     if resume_path is not None:
         if resume_path.is_dir():
             resume_path = resume_path / "checkpoint_last.pth"
@@ -644,6 +634,86 @@ def main() -> None:
             if wandb_run is not None:
                 wandb_run.finish()
             return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    output_root = output_dir.resolve()
+    checkpoint_root = checkpoint_dir.resolve()
+    print(f"[setup] outputs -> {output_root}")
+    print(f"[setup] checkpoints -> {checkpoint_root}")
+
+    if auto_resume_source_checkpoint is not None and not using_existing_run_dir:
+        resume_copy_target = checkpoint_dir / "checkpoint_resumed_from.pth"
+        if not resume_copy_target.exists():
+            shutil.copy2(auto_resume_source_checkpoint, resume_copy_target)
+            print(f"[setup] copied resume checkpoint -> {resume_copy_target}")
+
+    wandb_run_id_path = checkpoint_dir / "wandb_run_id.txt"
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError(
+                "Weights & Biases is not installed. Run 'pip install wandb' to enable logging."
+            )
+        wandb_resume_id: str | None = None
+        wandb_resume_mode: str | None = None
+        wandb_id_sources: list[Path] = []
+        if auto_resume_source_checkpoint is not None:
+            wandb_id_sources.append(auto_resume_source_checkpoint.parent / "wandb_run_id.txt")
+        wandb_id_sources.append(wandb_run_id_path)
+        for candidate in wandb_id_sources:
+            if candidate.exists():
+                run_id_candidate = candidate.read_text().strip()
+                if run_id_candidate:
+                    wandb_resume_id = run_id_candidate
+                    break
+        if wandb_resume_id is not None:
+            wandb_resume_mode = "allow"
+            print(f"[wandb] Resuming run id={wandb_resume_id}")
+
+        wandb_config = {
+            "variant": args.variant,
+            "coeff_window": args.coeff_window,
+            "trim_coefficients": args.trim_coefficients,
+            "range_mode": args.range_mode,
+            "image_size": args.image_size,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "lr_effective": effective_lr,
+            "lr_reference_batch": _LR_REFERENCE_BATCH,
+            "lr_cap": _LR_CAP,
+            "warmup_epochs": warmup_epochs,
+            "momentum": args.momentum,
+            "weight_decay": args.weight_decay,
+            "eta_min": args.eta_min,
+            "train_samples": len(train_loader.dataset),
+            "val_samples": len(val_loader.dataset),
+            "seed": args.seed,
+            "train_dirs": [str(p) for p in args.train_dirs],
+            "val_dir": str(args.val_dir),
+            "channels_last": args.channels_last,
+            "dct_stats_path": str(stats_path_resolved) if stats_path_resolved is not None else None,
+            "time_limit_hours": time_limit_hours,
+        }
+        default_name = run_subdir_name
+        run_name = args.wandb_run_name or default_name
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=run_name,
+            tags=args.wandb_tags,
+            config=wandb_config,
+            id=wandb_resume_id,
+            resume=wandb_resume_mode,
+        )
+        resolved_run_id = wandb_run.id
+        try:
+            wandb_run_id_path.write_text(resolved_run_id)
+        except OSError as exc:
+            print(f"[wandb] Warning: failed to persist run id to {wandb_run_id_path}: {exc}")
+
+    last_epoch_completed = start_epoch - 1
 
     if not args.eval_only:
         csv_path = checkpoint_dir / "training_params.csv"
@@ -796,6 +866,7 @@ def main() -> None:
                     f"val loss={val_stats['loss']:.4f} acc@1={val_stats['acc1']:.4f} acc@5={val_stats['acc5']:.4f}"
                     + (f" gpu_mem={gpu_mem:.1f}MB" if gpu_mem is not None else "")
                 )
+                last_epoch_completed = epoch
                 break
             current_lr = optimizer.param_groups[0]["lr"]
             if not warmup_active:
@@ -878,6 +949,8 @@ def main() -> None:
                     },
                     checkpoint_dir / f"checkpoint_{epoch:04d}.pth",
                 )
+
+            last_epoch_completed = epoch
 
     trimmed_val_stats: dict[str, float] | None = None
     if not args.trimmed_val_disable:
@@ -1053,6 +1126,38 @@ def main() -> None:
         else:
             print("Evaluation complete.")
     else:
+        if not using_existing_run_dir:
+            epoch_suffix = f"epoch{max(last_epoch_completed, 0):04d}"
+            final_run_subdir = f"{proposed_run_subdir}_{epoch_suffix}"
+            if final_run_subdir != run_subdir_name:
+                final_output_dir = base_output_dir / final_run_subdir
+                final_checkpoint_dir = base_checkpoint_dir / final_run_subdir
+                final_output_dir.parent.mkdir(parents=True, exist_ok=True)
+                final_checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
+                same_storage = checkpoint_dir.resolve() == output_dir.resolve()
+                if same_storage:
+                    if final_output_dir.exists():
+                        print(
+                            f"[setup] Target directory {final_output_dir} already exists; retaining {output_dir}."
+                        )
+                    else:
+                        output_dir.rename(final_output_dir)
+                        output_dir = final_output_dir
+                        checkpoint_dir = final_output_dir
+                        run_subdir_name = final_run_subdir
+                        print(f"[setup] renamed run directory -> {output_dir}")
+                else:
+                    if final_output_dir.exists() or final_checkpoint_dir.exists():
+                        print(
+                            "[setup] Target directories already exist; retaining original run directories."
+                        )
+                    else:
+                        output_dir.rename(final_output_dir)
+                        checkpoint_dir.rename(final_checkpoint_dir)
+                        output_dir = final_output_dir
+                        checkpoint_dir = final_checkpoint_dir
+                        run_subdir_name = final_run_subdir
+                        print(f"[setup] renamed run directory -> {output_dir}")
         print(f"Training complete. Best val acc@1={best_acc:.4f}")
         if time_limit_triggered:
             print("Stopped early due to the configured time limit.")

@@ -421,9 +421,7 @@ class CompressedPResNet(nn.Module):
             for key, value in state.items():
                 if not key.startswith("backbone"):
                     continue
-                trimmed = key
-                while trimmed.startswith("backbone."):
-                    trimmed = trimmed[len("backbone.") :]
+                trimmed = key[len("backbone.") :]
                 filtered[trimmed] = value
             missing, unexpected = self.backbone.load_state_dict(filtered, strict=strict_load)
             if missing or unexpected:

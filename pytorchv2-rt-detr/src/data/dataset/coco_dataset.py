@@ -5,6 +5,7 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import random
 import torch
 from faster_coco_eval.utils.pytorch import FasterCocoDetection
 import torchvision
@@ -25,7 +26,9 @@ class CocoDetection(FasterCocoDetection, DetDataset):
     __inject__ = ['transforms', ]
     __share__ = ['remap_mscoco_category']
     
-    def __init__(self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False):
+    def __init__(self, img_folder, ann_file, transforms, return_masks=False,
+                 remap_mscoco_category=False, max_samples: int | None = None,
+                 subset_seed: int = 0):
         super(FasterCocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
@@ -33,6 +36,23 @@ class CocoDetection(FasterCocoDetection, DetDataset):
         self.ann_file = ann_file
         self.return_masks = return_masks
         self.remap_mscoco_category = remap_mscoco_category
+
+        if max_samples is not None and max_samples > 0:
+            subset_ids = list(self.ids)
+            rng = random.Random(subset_seed)
+            rng.shuffle(subset_ids)
+            subset_ids = subset_ids[:max_samples]
+            subset_set = set(subset_ids)
+            self.ids = subset_ids
+            # Maintain auxiliary mappings when available so evaluation stays consistent.
+            if hasattr(self, "id_to_img_map") and isinstance(self.id_to_img_map, dict):
+                self.id_to_img_map = {
+                    image_id: index for image_id, index in self.id_to_img_map.items() if image_id in subset_set
+                }
+            if hasattr(self, "idx_to_img_id") and isinstance(self.idx_to_img_id, dict):
+                self.idx_to_img_id = {
+                    idx: image_id for idx, image_id in self.idx_to_img_id.items() if image_id in subset_set
+                }
 
     def __getitem__(self, idx):
         img, target = self.load_item(idx)

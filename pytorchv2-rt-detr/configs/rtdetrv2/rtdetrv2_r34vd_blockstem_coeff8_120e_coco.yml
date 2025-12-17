@@ -19,7 +19,7 @@ CompressedPResNet:
   freeze_at: -1
   freeze_norm: False
   pretrained: False
-  compressed_pretrained: null
+  compressed_pretrained: ./output/compressed_resnet34/crianns_weights/checkpoints/block-stem_coeff8/model_best.pth
   compression_variant: block-stem
   coeff_window: &coeff 8
   range_mode: studio
@@ -66,6 +66,7 @@ train_dataloader:
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: CompressToDCT, range_mode: studio, coeff_window: *coeff}
+        - {type: NormalizeDCTCoefficientsFromFile, path: configs/dct_stats/imagenet_coeff8_studio.pt, coeff_window: *coeff}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
       policy:
         name: stop_epoch
@@ -81,3 +82,4 @@ val_dataloader:
         - {type: Resize, size: [640, 640]}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: CompressToDCT, range_mode: studio, coeff_window: *coeff}
+        - {type: NormalizeDCTCoefficientsFromFile, path: configs/dct_stats/imagenet_coeff8_studio.pt, coeff_window: *coeff}

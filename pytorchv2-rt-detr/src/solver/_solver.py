@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Dict
 import atexit
 
+try:
+    import wandb  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
+
 from ..misc import dist_utils
 from ..core import BaseConfig
 
@@ -24,6 +29,7 @@ def to(m: nn.Module, device: str):
 class BaseSolver(object):
     def __init__(self, cfg: BaseConfig) -> None:
         self.cfg = cfg 
+        self.wandb_run = None
 
     def _setup(self, ):
         """Avoid instantiating unnecessary classes 
@@ -62,9 +68,12 @@ class BaseSolver(object):
             if dist_utils.is_main_process():
                 self.writer.add_text(f'config', '{:s}'.format(cfg.__repr__()), 0)
 
+        self._setup_wandb()
+
     def cleanup(self, ):
         if self.writer:
             atexit.register(self.writer.close)
+        self._finish_wandb()
 
     def train(self, ):
         self._setup()
@@ -78,6 +87,8 @@ class BaseSolver(object):
             shuffle=self.cfg.val_dataloader.shuffle)
 
         self.evaluator = self.cfg.evaluator
+
+        self._maybe_update_wandb_data_info()
 
         # NOTE instantiating order
         if self.cfg.resume:
@@ -95,6 +106,8 @@ class BaseSolver(object):
         if self.cfg.resume:
             print(f'Resume checkpoint from {self.cfg.resume}')
             self.load_resume_state(self.cfg.resume)
+
+        self._maybe_update_wandb_data_info()
 
     def to(self, device):
         for k, v in self.__dict__.items():
@@ -213,6 +226,67 @@ class BaseSolver(object):
                 missed_list.append(k)
 
         return matched_state, {'missed': missed_list, 'unmatched': unmatched_list}
+
+    def _setup_wandb(self) -> None:
+        if not getattr(self.cfg, 'wandb', False):
+            self.wandb_run = None
+            return
+        if wandb is None:
+            raise RuntimeError("Weights & Biases is not installed. Run 'pip install wandb' to enable logging.")
+        if not dist_utils.is_main_process():
+            self.wandb_run = None
+            return
+
+        run_name = self.cfg.wandb_run_name or self.output_dir.name
+        project = self.cfg.wandb_project or 'rtdetr-detection'
+        wandb_tags = self.cfg.wandb_tags
+
+        wandb_config = {
+            "task": self.cfg.task,
+            "epoches": self.cfg.epoches,
+            "batch_size": self.cfg.batch_size,
+            "use_amp": self.cfg.use_amp,
+            "use_ema": self.cfg.use_ema,
+            "resume": bool(self.cfg.resume),
+            "tuning": bool(self.cfg.tuning),
+        }
+        if self.cfg.output_dir:
+            wandb_config["output_dir"] = str(self.cfg.output_dir)
+        if self.cfg.device:
+            wandb_config["device"] = self.cfg.device
+
+        self.wandb_run = wandb.init(
+            project=project,
+            entity=self.cfg.wandb_entity or None,
+            name=run_name,
+            tags=wandb_tags,
+            config=wandb_config,
+        )
+
+    def _finish_wandb(self) -> None:
+        if self.wandb_run is not None:
+            if dist_utils.is_main_process():
+                self.wandb_run.finish()
+            self.wandb_run = None
+
+    def _maybe_update_wandb_data_info(self) -> None:
+        if self.wandb_run is None or not dist_utils.is_main_process():
+            return
+        info = {}
+        train_loader = getattr(self, 'train_dataloader', None)
+        if train_loader is not None:
+            try:
+                info["train_samples"] = len(train_loader.dataset)
+            except Exception:
+                pass
+        val_loader = getattr(self, 'val_dataloader', None)
+        if val_loader is not None:
+            try:
+                info["val_samples"] = len(val_loader.dataset)
+            except Exception:
+                pass
+        if info:
+            self.wandb_run.config.update(info, allow_val_change=True)
 
 
     def fit(self, ):

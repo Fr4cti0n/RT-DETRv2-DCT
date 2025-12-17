@@ -71,6 +71,12 @@ class BaseConfig(object):
         self.summary_dir :str = None
         self.device : str = ''
 
+        self.wandb :bool = False
+        self.wandb_project :str = 'rtdetr-detection'
+        self.wandb_entity :str = None
+        self.wandb_run_name :str = None
+        self.wandb_tags :List[str] | None = None
+
     @property
     def model(self, ) -> nn.Module:
         return self._model 
