@@ -91,11 +91,9 @@ def _upsample_chroma(chroma: torch.Tensor, target_hw: Tuple[int, int]) -> torch.
 
 def _build_active_index_from_count(coeff_count: int) -> torch.Tensor | None:
     count = validate_coeff_count(coeff_count, name="coeff_count")
-    if count >= 64:
+    if count <= 0 or count >= 64:
         return None
     indices = build_active_indices(count)
-    if not indices:
-        return torch.empty(0, dtype=torch.long)
     return torch.tensor(indices, dtype=torch.long)
 
 
@@ -131,6 +129,8 @@ class _BackboneAdapter(nn.Module):
         *,
         name: str,
     ) -> torch.Tensor:
+        if target_count <= 0:
+            return plane.new_empty((plane.size(0), 0, plane.size(2), plane.size(3)))
         if plane.size(1) > target_count:
             if active_idx is not None and active_idx.numel() > 0:
                 max_idx = int(active_idx.max().item())
@@ -261,38 +261,55 @@ class CompressedResNetBlockStem(_BackboneAdapter):
         self.chroma_channels_cb = self.coeff_count_cb
         self.chroma_channels_cr = self.coeff_count_cr
         self.chroma_channels = self.chroma_channels_cb + self.chroma_channels_cr
+        self.has_luma = self.luma_channels > 0
+        self.has_cb = self.chroma_channels_cb > 0
+        self.has_cr = self.chroma_channels_cr > 0
+        self.has_chroma = self.has_cb or self.has_cr
+        if not (self.has_luma or self.has_chroma):
+            raise ValueError("At least one DCT plane must remain active for block-stem variant.")
         active_idx_luma = _build_active_index_from_count(self.coeff_count_luma)
         active_idx_cb = _build_active_index_from_count(self.coeff_count_cb)
         active_idx_cr = _build_active_index_from_count(self.coeff_count_cr)
-        if active_idx_luma is not None:
+        if active_idx_luma is not None and self.has_luma:
             self.register_buffer("active_idx_luma", active_idx_luma, persistent=False)
         else:
             self.active_idx_luma = None
-        if active_idx_cb is not None:
+        if active_idx_cb is not None and self.has_cb:
             self.register_buffer("active_idx_cb", active_idx_cb, persistent=False)
         else:
             self.active_idx_cb = None
-        if active_idx_cr is not None:
+        if active_idx_cr is not None and self.has_cr:
             self.register_buffer("active_idx_cr", active_idx_cr, persistent=False)
         else:
             self.active_idx_cr = None
         mid_channels = max(self.target_channels, 64)
-        self.luma_proj = nn.Sequential(
-            nn.Conv2d(self.luma_channels, mid_channels, kernel_size=1, padding=0, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.SiLU(inplace=True),
-        )
-        self.chroma_proj = nn.Sequential(
-            nn.Conv2d(self.chroma_channels, mid_channels // 2, kernel_size=1, padding=0, bias=False),
-            nn.BatchNorm2d(mid_channels // 2),
-            nn.SiLU(inplace=True),
-        )
-        fusion_in = mid_channels + mid_channels // 2
-        self.fusion = nn.Sequential(
-            nn.Conv2d(fusion_in, self.target_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(self.target_channels),
-            nn.SiLU(inplace=True),
-        )
+        self.luma_width = mid_channels if self.has_luma else 0
+        self.chroma_width = mid_channels // 2 if self.has_chroma else 0
+        if self.has_luma:
+            self.luma_proj = nn.Sequential(
+                nn.Conv2d(self.luma_channels, self.luma_width, kernel_size=1, padding=0, bias=False),
+                nn.BatchNorm2d(self.luma_width),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.luma_proj = None
+        if self.has_chroma:
+            self.chroma_proj = nn.Sequential(
+                nn.Conv2d(self.chroma_channels, self.chroma_width, kernel_size=1, padding=0, bias=False),
+                nn.BatchNorm2d(self.chroma_width),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.chroma_proj = None
+        fusion_in = (self.luma_width if self.has_luma else 0) + (self.chroma_width if self.has_chroma else 0)
+        if fusion_in == self.target_channels:
+            self.fusion = nn.Identity()
+        else:
+            self.fusion = nn.Sequential(
+                nn.Conv2d(fusion_in, self.target_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.target_channels),
+                nn.SiLU(inplace=True),
+            )
 
     def forward(self, inputs):
         y_blocks, (cb_blocks, cr_blocks) = _unpack_payload(inputs)
@@ -301,30 +318,61 @@ class CompressedResNetBlockStem(_BackboneAdapter):
         cb_blocks = cb_blocks.to(device=device, dtype=torch.float32)
         cr_blocks = cr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
-            idx_luma = self.active_idx_luma.to(device)
-            y_blocks = torch.index_select(y_blocks, 1, idx_luma)
-        elif y_blocks.size(1) != self.luma_channels:
-            raise ValueError(
-                f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
-            )
+        features: list[torch.Tensor] = []
+
+        if self.has_luma:
+            if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
+                idx_luma = self.active_idx_luma.to(device)
+                y_blocks = torch.index_select(y_blocks, 1, idx_luma)
+            elif y_blocks.size(1) != self.luma_channels:
+                raise ValueError(
+                    f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
+                )
+            y_feat = self.luma_proj(y_blocks) if self.luma_proj is not None else y_blocks
+            features.append(y_feat)
+        else:
+            if y_blocks.size(1) != 0:
+                raise ValueError(
+                    "Luma coefficients were disabled but input still provides non-zero channels."
+                )
 
         cb = cb_blocks
         cr = cr_blocks
-        cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
-        cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
+        if self.chroma_channels_cb > 0:
+            cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
+        else:
+            cb = cb.new_empty((cb.size(0), 0, cb.size(2), cb.size(3)))
+        if self.chroma_channels_cr > 0:
+            cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
+        else:
+            cr = cr.new_empty((cr.size(0), 0, cr.size(2), cr.size(3)))
 
-        chroma = torch.cat((cb, cr), dim=1)
-        if chroma.size(1) != self.chroma_channels:
-            raise ValueError(
-                f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
-                f"received {chroma.size(1)}."
-            )
-        chroma = F.interpolate(chroma, size=y_blocks.shape[-2:], mode="nearest")
+        if self.has_chroma:
+            chroma_parts = []
+            if self.chroma_channels_cb > 0:
+                chroma_parts.append(cb)
+            if self.chroma_channels_cr > 0:
+                chroma_parts.append(cr)
+            chroma = torch.cat(chroma_parts, dim=1)
+            if chroma.size(1) != self.chroma_channels:
+                raise ValueError(
+                    f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
+                    f"received {chroma.size(1)}."
+                )
+            chroma = F.interpolate(chroma, size=y_blocks.shape[-2:], mode="nearest")
+            chroma_feat = self.chroma_proj(chroma) if self.chroma_proj is not None else chroma
+            features.append(chroma_feat)
+        else:
+            if cb.size(1) != 0 or cr.size(1) != 0:
+                raise ValueError("Chroma coefficients were disabled but payload still includes channels.")
 
-        y_feat = self.luma_proj(y_blocks)
-        chroma_feat = self.chroma_proj(chroma)
-        fused = self.fusion(torch.cat((y_feat, chroma_feat), dim=1))
+        if not features:
+            raise RuntimeError("No active coefficient branches available for fusion.")
+        if len(features) == 1:
+            fusion_input = features[0]
+        else:
+            fusion_input = torch.cat(features, dim=1)
+        fused = fusion_input if isinstance(self.fusion, nn.Identity) else self.fusion(fusion_input)
         conv1_like = F.interpolate(fused, scale_factor=2.0, mode="bilinear", align_corners=False)
         return self._forward_residual_stages(conv1_like, skip_pool=True)
 
@@ -369,39 +417,57 @@ class CompressedResNetLumaFusion(_BackboneAdapter):
         self.chroma_channels_cb = self.coeff_count_cb
         self.chroma_channels_cr = self.coeff_count_cr
         self.chroma_channels = self.chroma_channels_cb + self.chroma_channels_cr
+        self.has_luma = self.luma_channels > 0
+        self.has_cb = self.chroma_channels_cb > 0
+        self.has_cr = self.chroma_channels_cr > 0
+        self.has_chroma = self.has_cb or self.has_cr
+        if not (self.has_luma or self.has_chroma):
+            raise ValueError("At least one DCT plane must remain active for luma-fusion variant.")
         active_idx_luma = _build_active_index_from_count(self.coeff_count_luma)
         active_idx_cb = _build_active_index_from_count(self.coeff_count_cb)
         active_idx_cr = _build_active_index_from_count(self.coeff_count_cr)
-        if active_idx_luma is not None:
+        if active_idx_luma is not None and self.has_luma:
             self.register_buffer("active_idx_luma", active_idx_luma, persistent=False)
         else:
             self.active_idx_luma = None
-        if active_idx_cb is not None:
+        if active_idx_cb is not None and self.has_cb:
             self.register_buffer("active_idx_cb", active_idx_cb, persistent=False)
         else:
             self.active_idx_cb = None
-        if active_idx_cr is not None:
+        if active_idx_cr is not None and self.has_cr:
             self.register_buffer("active_idx_cr", active_idx_cr, persistent=False)
         else:
             self.active_idx_cr = None
-        luma_width = max(self.target_channels, 64)
-        chroma_width = luma_width // 2
-        self.luma_down = nn.Sequential(
-            nn.Conv2d(self.luma_channels, luma_width, kernel_size=1, stride=2, padding=0, bias=False),
-            nn.BatchNorm2d(luma_width),
-            nn.SiLU(inplace=True),
-        )
-        self.chroma_proj = nn.Sequential(
-            nn.Conv2d(self.chroma_channels, chroma_width, kernel_size=1, padding=0, bias=False),
-            nn.BatchNorm2d(chroma_width),
-            nn.SiLU(inplace=True),
-        )
-        fusion_in = luma_width + chroma_width
-        self.fusion = nn.Sequential(
-            nn.Conv2d(fusion_in, self.target_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(self.target_channels),
-            nn.SiLU(inplace=True),
-        )
+        base_width = max(self.target_channels, 64)
+        self.luma_width = base_width if self.has_luma else 0
+        self.chroma_width = max(base_width // 2, 1) if self.has_chroma else 0
+        if self.has_luma:
+            self.luma_down = nn.Sequential(
+                nn.Conv2d(self.luma_channels, self.luma_width, kernel_size=1, stride=2, padding=0, bias=False),
+                nn.BatchNorm2d(self.luma_width),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.luma_down = None
+        if self.has_chroma:
+            self.chroma_proj = nn.Sequential(
+                nn.Conv2d(self.chroma_channels, self.chroma_width, kernel_size=1, padding=0, bias=False),
+                nn.BatchNorm2d(self.chroma_width),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.chroma_proj = None
+        fusion_in = (self.luma_width if self.has_luma else 0) + (self.chroma_width if self.has_chroma else 0)
+        if fusion_in == 0:
+            raise ValueError("Luma-fusion adapter received empty feature configuration.")
+        if fusion_in == self.target_channels:
+            self.fusion = nn.Identity()
+        else:
+            self.fusion = nn.Sequential(
+                nn.Conv2d(fusion_in, self.target_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.target_channels),
+                nn.SiLU(inplace=True),
+            )
 
     def forward(self, inputs):
         y_blocks, (cb_blocks, cr_blocks) = _unpack_payload(inputs)
@@ -410,28 +476,60 @@ class CompressedResNetLumaFusion(_BackboneAdapter):
         cb_blocks = cb_blocks.to(device=device, dtype=torch.float32)
         cr_blocks = cr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
-            idx_luma = self.active_idx_luma.to(device)
-            y_blocks = torch.index_select(y_blocks, 1, idx_luma)
-        elif y_blocks.size(1) != self.luma_channels:
-            raise ValueError(
-                f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
-            )
+        features: list[torch.Tensor] = []
+
+        if self.has_luma:
+            if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
+                idx_luma = self.active_idx_luma.to(device)
+                y_blocks = torch.index_select(y_blocks, 1, idx_luma)
+            elif y_blocks.size(1) != self.luma_channels:
+                raise ValueError(
+                    f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
+                )
+            luma_feat = self.luma_down(y_blocks) if self.luma_down is not None else y_blocks
+            features.append(luma_feat)
+        else:
+            if y_blocks.size(1) != 0:
+                raise ValueError(
+                    "Luma coefficients were disabled but input still provides non-zero channels."
+                )
 
         cb = cb_blocks
         cr = cr_blocks
-        cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
-        cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
+        if self.chroma_channels_cb > 0:
+            cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
+        else:
+            cb = cb.new_empty((cb.size(0), 0, cb.size(2), cb.size(3)))
+        if self.chroma_channels_cr > 0:
+            cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
+        else:
+            cr = cr.new_empty((cr.size(0), 0, cr.size(2), cr.size(3)))
 
-        luma_feat = self.luma_down(y_blocks)
-        chroma = torch.cat((cb, cr), dim=1)
-        if chroma.size(1) != self.chroma_channels:
-            raise ValueError(
-                f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
-                f"received {chroma.size(1)}."
-            )
-        chroma_feat = self.chroma_proj(chroma)
-        fused = self.fusion(torch.cat((luma_feat, chroma_feat), dim=1))
+        if self.has_chroma:
+            chroma_parts = []
+            if self.chroma_channels_cb > 0:
+                chroma_parts.append(cb)
+            if self.chroma_channels_cr > 0:
+                chroma_parts.append(cr)
+            chroma = torch.cat(chroma_parts, dim=1)
+            if chroma.size(1) != self.chroma_channels:
+                raise ValueError(
+                    f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
+                    f"received {chroma.size(1)}."
+                )
+            chroma_feat = self.chroma_proj(chroma) if self.chroma_proj is not None else chroma
+            features.append(chroma_feat)
+        else:
+            if cb.size(1) != 0 or cr.size(1) != 0:
+                raise ValueError("Chroma coefficients were disabled but payload still includes channels.")
+
+        if not features:
+            raise RuntimeError("No active coefficient branches available for fusion.")
+        if len(features) == 1:
+            fusion_input = features[0]
+        else:
+            fusion_input = torch.cat(features, dim=1)
+        fused = fusion_input if isinstance(self.fusion, nn.Identity) else self.fusion(fusion_input)
         conv1_like = F.interpolate(fused, scale_factor=4.0, mode="bilinear", align_corners=False)
         return self._forward_residual_stages(conv1_like, skip_pool=True)
 
@@ -478,40 +576,57 @@ class CompressedResNetLumaFusionPruned(_BackboneAdapter):
         self.chroma_channels_cb = self.coeff_count_cb
         self.chroma_channels_cr = self.coeff_count_cr
         self.chroma_channels = self.chroma_channels_cb + self.chroma_channels_cr
+        self.has_luma = self.luma_channels > 0
+        self.has_cb = self.chroma_channels_cb > 0
+        self.has_cr = self.chroma_channels_cr > 0
+        self.has_chroma = self.has_cb or self.has_cr
+        if not (self.has_luma or self.has_chroma):
+            raise ValueError("At least one DCT plane must remain active for pruned luma-fusion variant.")
         active_idx_luma = _build_active_index_from_count(self.coeff_count_luma)
         active_idx_cb = _build_active_index_from_count(self.coeff_count_cb)
         active_idx_cr = _build_active_index_from_count(self.coeff_count_cr)
-        if active_idx_luma is not None:
+        if active_idx_luma is not None and self.has_luma:
             self.register_buffer("active_idx_luma", active_idx_luma, persistent=False)
         else:
             self.active_idx_luma = None
-        if active_idx_cb is not None:
+        if active_idx_cb is not None and self.has_cb:
             self.register_buffer("active_idx_cb", active_idx_cb, persistent=False)
         else:
             self.active_idx_cb = None
-        if active_idx_cr is not None:
+        if active_idx_cr is not None and self.has_cr:
             self.register_buffer("active_idx_cr", active_idx_cr, persistent=False)
         else:
             self.active_idx_cr = None
         self._shrink_backbone(scale)
-        luma_width = max(self.target_channels, 8)
-        chroma_width = max(luma_width // 2, 4)
-        self.luma_down = nn.Sequential(
-            nn.Conv2d(self.luma_channels, luma_width, kernel_size=1, stride=2, padding=0, bias=False),
-            nn.BatchNorm2d(luma_width),
-            nn.SiLU(inplace=True),
-        )
-        self.chroma_proj = nn.Sequential(
-            nn.Conv2d(self.chroma_channels, chroma_width, kernel_size=1, padding=0, bias=False),
-            nn.BatchNorm2d(chroma_width),
-            nn.SiLU(inplace=True),
-        )
-        fusion_in = luma_width + chroma_width
-        self.fusion = nn.Sequential(
-            nn.Conv2d(fusion_in, self.target_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(self.target_channels),
-            nn.SiLU(inplace=True),
-        )
+        self.luma_width = max(self.target_channels, 8) if self.has_luma else 0
+        self.chroma_width = max(self.luma_width // 2, 4) if self.has_chroma else 0
+        if self.has_luma:
+            self.luma_down = nn.Sequential(
+                nn.Conv2d(self.luma_channels, self.luma_width, kernel_size=1, stride=2, padding=0, bias=False),
+                nn.BatchNorm2d(self.luma_width),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.luma_down = None
+        if self.has_chroma:
+            self.chroma_proj = nn.Sequential(
+                nn.Conv2d(self.chroma_channels, self.chroma_width, kernel_size=1, padding=0, bias=False),
+                nn.BatchNorm2d(self.chroma_width),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.chroma_proj = None
+        fusion_in = (self.luma_width if self.has_luma else 0) + (self.chroma_width if self.has_chroma else 0)
+        if fusion_in == 0:
+            raise ValueError("Pruned luma-fusion adapter received empty feature configuration.")
+        if fusion_in == self.target_channels:
+            self.fusion = nn.Identity()
+        else:
+            self.fusion = nn.Sequential(
+                nn.Conv2d(fusion_in, self.target_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.target_channels),
+                nn.SiLU(inplace=True),
+            )
 
     def _shrink_backbone(self, scale: float) -> None:
         block_cls = type(self.backbone.res_layers[0].blocks[0])
@@ -555,28 +670,60 @@ class CompressedResNetLumaFusionPruned(_BackboneAdapter):
         cb_blocks = cb_blocks.to(device=device, dtype=torch.float32)
         cr_blocks = cr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
-            idx_luma = self.active_idx_luma.to(device)
-            y_blocks = torch.index_select(y_blocks, 1, idx_luma)
-        elif y_blocks.size(1) != self.luma_channels:
-            raise ValueError(
-                f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
-            )
+        features: list[torch.Tensor] = []
+
+        if self.has_luma:
+            if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
+                idx_luma = self.active_idx_luma.to(device)
+                y_blocks = torch.index_select(y_blocks, 1, idx_luma)
+            elif y_blocks.size(1) != self.luma_channels:
+                raise ValueError(
+                    f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
+                )
+            luma_feat = self.luma_down(y_blocks) if self.luma_down is not None else y_blocks
+            features.append(luma_feat)
+        else:
+            if y_blocks.size(1) != 0:
+                raise ValueError(
+                    "Luma coefficients were disabled but input still provides non-zero channels."
+                )
 
         cb = cb_blocks
         cr = cr_blocks
-        cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
-        cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
+        if self.chroma_channels_cb > 0:
+            cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
+        else:
+            cb = cb.new_empty((cb.size(0), 0, cb.size(2), cb.size(3)))
+        if self.chroma_channels_cr > 0:
+            cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
+        else:
+            cr = cr.new_empty((cr.size(0), 0, cr.size(2), cr.size(3)))
 
-        luma_feat = self.luma_down(y_blocks)
-        chroma = torch.cat((cb, cr), dim=1)
-        if chroma.size(1) != self.chroma_channels:
-            raise ValueError(
-                f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
-                f"received {chroma.size(1)}."
-            )
-        chroma_feat = self.chroma_proj(chroma)
-        fused = self.fusion(torch.cat((luma_feat, chroma_feat), dim=1))
+        if self.has_chroma:
+            chroma_parts = []
+            if self.chroma_channels_cb > 0:
+                chroma_parts.append(cb)
+            if self.chroma_channels_cr > 0:
+                chroma_parts.append(cr)
+            chroma = torch.cat(chroma_parts, dim=1)
+            if chroma.size(1) != self.chroma_channels:
+                raise ValueError(
+                    f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
+                    f"received {chroma.size(1)}."
+                )
+            chroma_feat = self.chroma_proj(chroma) if self.chroma_proj is not None else chroma
+            features.append(chroma_feat)
+        else:
+            if cb.size(1) != 0 or cr.size(1) != 0:
+                raise ValueError("Chroma coefficients were disabled but payload still includes channels.")
+
+        if not features:
+            raise RuntimeError("No active coefficient branches available for fusion.")
+        if len(features) == 1:
+            fusion_input = features[0]
+        else:
+            fusion_input = torch.cat(features, dim=1)
+        fused = fusion_input if isinstance(self.fusion, nn.Identity) else self.fusion(fusion_input)
         conv1_like = F.interpolate(fused, scale_factor=4.0, mode="bilinear", align_corners=False)
         return self._forward_residual_stages(conv1_like, skip_pool=True)
 

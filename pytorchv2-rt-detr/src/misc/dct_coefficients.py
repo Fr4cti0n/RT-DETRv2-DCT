@@ -104,6 +104,8 @@ def window_to_count(window: int) -> int:
 
 def count_to_window(count: int) -> int | None:
     count_validated = validate_coeff_count(count, name="coeff_count")
+    if count_validated == 0:
+        return None
     root = int(math.isqrt(count_validated))
     if root * root != count_validated:
         return None
