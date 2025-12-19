@@ -21,10 +21,27 @@ from torchvision.transforms import v2 as T
 
 from .frame_dct import FrameDCT
 from ...core import register
+from ...misc.dct_coefficients import (
+    build_active_indices,
+    build_active_mask,
+    count_to_window,
+    resolve_coefficient_counts,
+    validate_coeff_count,
+)
 
 RangeMode = tuple[str, ...]
 
 TensorLike = Union[torch.Tensor, np.ndarray]
+
+
+def _parse_coeff_count(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:  # pragma: no cover - argparse already reports format errors
+        raise argparse.ArgumentTypeError("coefficient count must be an integer") from exc
+    if not 0 <= parsed <= 64:
+        raise argparse.ArgumentTypeError("coefficient count must be within [0, 64]")
+    return parsed
 
 
 def _ensure_macroblock_multiple(image: np.ndarray) -> np.ndarray:
@@ -92,23 +109,22 @@ def _plane_to_blocks(dct_plane: np.ndarray) -> np.ndarray:
     return blocks
 
 
-def _build_active_index(coeff_window: int) -> np.ndarray | None:
-    if coeff_window >= 8:
+def _build_active_index(coeff_count: int) -> np.ndarray | None:
+    count = validate_coeff_count(coeff_count, name="coeff_count")
+    if count >= 64:
         return None
-    indices = [row + col * 8 for col in range(coeff_window) for row in range(coeff_window)]
+    indices = build_active_indices(count)
     return np.array(indices, dtype=np.int64)
 
 
-def _apply_frequency_window(blocks: np.ndarray, coeff_window: int) -> np.ndarray:
-    """Zero out high-frequency coefficients outside a size×size window per block."""
-    if coeff_window not in (1, 2, 4, 8):
-        raise ValueError(f"Unsupported coefficient window: {coeff_window}")
-    if coeff_window == 8:
+def _apply_frequency_selection(blocks: np.ndarray, coeff_count: int) -> np.ndarray:
+    """Zero out high-frequency coefficients outside the selected subset per block."""
+    count = validate_coeff_count(coeff_count, name="coeff_count")
+    if count >= 64:
         return blocks
-    mask = np.zeros((8, 8), dtype=np.float32)
-    mask[:coeff_window, :coeff_window] = 1.0
-    reshaped = blocks.reshape((-1, 8, 8), order="F")
-    reshaped *= mask
+    mask_vec = np.array(build_active_mask(count), dtype=np.float32)
+    reshaped = blocks.reshape((-1, 64), order="F")
+    reshaped *= mask_vec
     return reshaped.reshape(blocks.shape, order="F")
 
 
@@ -123,7 +139,9 @@ def _forward_dct(plane: np.ndarray) -> np.ndarray:
 def _compress_image_array(
     image_bgr: np.ndarray,
     range_mode: str,
-    coeff_window: int,
+    coeff_count_luma: int,
+    coeff_count_cb: int,
+    coeff_count_cr: int,
     round_blocks: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """Core helper that converts a BGR image into DCT coefficient blocks."""
@@ -142,9 +160,9 @@ def _compress_image_array(
     cb_blocks = _plane_to_blocks(cb_dct)
     cr_blocks = _plane_to_blocks(cr_dct)
 
-    luma_blocks = _apply_frequency_window(luma_blocks, coeff_window)
-    cb_blocks = _apply_frequency_window(cb_blocks, coeff_window)
-    cr_blocks = _apply_frequency_window(cr_blocks, coeff_window)
+    luma_blocks = _apply_frequency_selection(luma_blocks, coeff_count_luma)
+    cb_blocks = _apply_frequency_selection(cb_blocks, coeff_count_cb)
+    cr_blocks = _apply_frequency_selection(cr_blocks, coeff_count_cr)
 
     if round_blocks:
         luma_blocks = np.rint(luma_blocks).astype(np.int16, copy=False)
@@ -158,12 +176,30 @@ def _compress_image_array(
     luma_grid_shape = np.array(luma_blocks.shape[:2], dtype=np.int32)
     chroma_grid_shape = np.array(cb_blocks.shape[:2], dtype=np.int32)
 
+    window_luma = count_to_window(coeff_count_luma)
+    window_cb = count_to_window(coeff_count_cb)
+    window_cr = count_to_window(coeff_count_cr)
+    window_chroma = window_cb if window_cb == window_cr else None
+    coeff_count_chroma = coeff_count_cb if coeff_count_cb == coeff_count_cr else max(coeff_count_cb, coeff_count_cr)
     metadata = {
         "spatial_shape": np.array(y_plane.shape, dtype=np.int32),
         "chroma_shape": np.array(cb_plane.shape, dtype=np.int32),
-        "coeff_window": np.array(coeff_window, dtype=np.int32),
+        "coeff_window": np.array(window_luma if window_luma is not None else -1, dtype=np.int32),
+        "coeff_window_luma": np.array(window_luma if window_luma is not None else -1, dtype=np.int32),
+        "coeff_window_chroma": np.array(window_chroma if window_chroma is not None else -1, dtype=np.int32),
+        "coeff_window_cb": np.array(window_cb if window_cb is not None else -1, dtype=np.int32),
+        "coeff_window_cr": np.array(window_cr if window_cr is not None else -1, dtype=np.int32),
+        "coeff_count": np.array(coeff_count_luma, dtype=np.int32),
+        "coeff_count_luma": np.array(coeff_count_luma, dtype=np.int32),
+        "coeff_count_chroma": np.array(coeff_count_chroma, dtype=np.int32),
+        "coeff_count_cb": np.array(coeff_count_cb, dtype=np.int32),
+        "coeff_count_cr": np.array(coeff_count_cr, dtype=np.int32),
         "coefficients_per_block": np.array(64, dtype=np.int32),
-        "active_coefficients": np.array(coeff_window * coeff_window, dtype=np.int32),
+        "active_coefficients": np.array(coeff_count_luma, dtype=np.int32),
+        "active_coefficients_luma": np.array(coeff_count_luma, dtype=np.int32),
+        "active_coefficients_chroma": np.array(coeff_count_chroma, dtype=np.int32),
+        "active_coefficients_cb": np.array(coeff_count_cb, dtype=np.int32),
+        "active_coefficients_cr": np.array(coeff_count_cr, dtype=np.int32),
         "luma_grid_shape": luma_grid_shape,
         "chroma_grid_shape": chroma_grid_shape,
     }
@@ -171,14 +207,33 @@ def _compress_image_array(
     return luma_blocks, cb_blocks, cr_blocks, metadata
 
 
-def compress_reference_image(path: Path, range_mode: str, coeff_window: int) -> dict[str, np.ndarray]:
+def compress_reference_image(
+    path: Path,
+    range_mode: str,
+    coeff_count_luma: int,
+    coeff_count_cb: int | None = None,
+    coeff_count_cr: int | None = None,
+) -> dict[str, np.ndarray]:
     """Compute Y, Cb, Cr DCT blocks for a single reference image."""
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"Unable to read image: {path}")
 
+    coeff_count_luma = validate_coeff_count(coeff_count_luma, name="coeff_count_luma")
+    chroma_count_cb = coeff_count_luma if coeff_count_cb is None else validate_coeff_count(
+        coeff_count_cb, name="coeff_count_cb"
+    )
+    chroma_count_cr = coeff_count_luma if coeff_count_cr is None else validate_coeff_count(
+        coeff_count_cr, name="coeff_count_cr"
+    )
+
     luma_blocks, cb_blocks, cr_blocks, metadata = _compress_image_array(
-        image, range_mode, coeff_window, round_blocks=True
+        image,
+        range_mode,
+        coeff_count_luma,
+        chroma_count_cb,
+        chroma_count_cr,
+        round_blocks=True,
     )
 
     return {
@@ -218,9 +273,9 @@ def _resolve_torch_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
 class CompressToDCT(T.Transform):
     """Transform that converts an RGB tensor into DCT coefficient blocks.
 
-    Returns a tuple ``(y_blocks, cbcr_blocks)`` where ``y_blocks`` has shape
-    ``(64, nb_y, nb_x)`` and ``cbcr_blocks`` has shape ``(2, 64, nb_y//2, nb_x//2)``
-    for 4:2:0 chroma subsampling. When ``keep_original`` is ``True`` the original
+    Returns a tuple ``(y_blocks, (cb_blocks, cr_blocks))`` where ``y_blocks`` has
+    shape ``(64, nb_y, nb_x)`` while the chroma planes retain their independent
+    coefficient depths without padding. When ``keep_original`` is ``True`` the original
     input is appended as a second element.
     """
 
@@ -230,17 +285,53 @@ class CompressToDCT(T.Transform):
         range_mode: str = "studio",
         dtype: Union[str, torch.dtype] = torch.float32,
         keep_original: bool = False,
+        *,
+        coeff_window_luma: int | None = None,
+        coeff_window_chroma: int | None = None,
+        coeff_window_cb: int | None = None,
+        coeff_window_cr: int | None = None,
+        coeff_count: int | None = None,
+        coeff_count_luma: int | None = None,
+        coeff_count_chroma: int | None = None,
+        coeff_count_cb: int | None = None,
+        coeff_count_cr: int | None = None,
+        selection_order: str = "zigzag",
     ) -> None:
         super().__init__()
         if range_mode not in {"studio", "full"}:
             raise ValueError(f"Unsupported range_mode: {range_mode}")
-        if coeff_window not in (1, 2, 4, 8):
-            raise ValueError(f"Unsupported coeff_window: {coeff_window}")
+        if selection_order != "zigzag":
+            raise ValueError(f"Unsupported coefficient selection order: {selection_order}")
 
-        self.coeff_window = coeff_window
+        base_count, luma_count, cb_count, cr_count = resolve_coefficient_counts(
+            coeff_window=coeff_window,
+            coeff_count=coeff_count,
+            coeff_window_luma=coeff_window_luma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
+
+        self.coeff_count = base_count
+        self.coeff_count_luma = luma_count
+        self.coeff_count_cb = cb_count
+        self.coeff_count_cr = cr_count
+        self.coeff_count_chroma = cb_count if cb_count == cr_count else max(cb_count, cr_count)
+        self.coeff_window = count_to_window(luma_count)
+        self.coeff_window_luma = count_to_window(luma_count)
+        self.coeff_window_cb = count_to_window(cb_count)
+        self.coeff_window_cr = count_to_window(cr_count)
+        self.coeff_window_chroma = (
+            self.coeff_window_cb if self.coeff_window_cb == self.coeff_window_cr else None
+        )
         self.range_mode = range_mode
         self.dtype = _resolve_torch_dtype(dtype)
         self.keep_original = keep_original
+        self.selection_order = selection_order
 
     @staticmethod
     def _to_bgr_array(image: TensorLike) -> np.ndarray:
@@ -303,24 +394,52 @@ class CompressToDCT(T.Transform):
         original = image if self.keep_original else None
         bgr_image = self._to_bgr_array(image)
         luma_blocks, cb_blocks, cr_blocks, metadata = _compress_image_array(
-            bgr_image, self.range_mode, self.coeff_window, round_blocks=False
+            bgr_image,
+            self.range_mode,
+            self.coeff_count_luma,
+            self.coeff_count_cb,
+            self.coeff_count_cr,
+            round_blocks=False,
         )
 
         y_tensor = self._blocks_to_tensor(luma_blocks, self.dtype)
         cb_tensor = self._blocks_to_tensor(cb_blocks, self.dtype)
         cr_tensor = self._blocks_to_tensor(cr_blocks, self.dtype)
-        cbcr_tensor = torch.stack((cb_tensor, cr_tensor), dim=0)
+        cbcr_payload = (cb_tensor, cr_tensor)
 
-        payload = (y_tensor, cbcr_tensor)
+        payload = (y_tensor, cbcr_payload)
 
         # Attach useful metadata to the target when it is a mutable mapping.
         if target is not None and hasattr(target, "update") and callable(target.update):
+            coeff_window = int(metadata.get("coeff_window", -1))
+            coeff_window_luma = int(metadata.get("coeff_window_luma", -1))
+            coeff_window_chroma = int(metadata.get("coeff_window_chroma", -1))
+            coeff_window_cb = int(metadata.get("coeff_window_cb", -1))
+            coeff_window_cr = int(metadata.get("coeff_window_cr", -1))
+            coeff_count = int(metadata.get("coeff_count", self.coeff_count_luma))
+            coeff_count_luma = int(metadata.get("coeff_count_luma", self.coeff_count_luma))
+            coeff_count_chroma = int(metadata.get("coeff_count_chroma", self.coeff_count_chroma))
+            coeff_count_cb = int(metadata.get("coeff_count_cb", self.coeff_count_cb))
+            coeff_count_cr = int(metadata.get("coeff_count_cr", self.coeff_count_cr))
             target.update({
                 "dct_spatial_shape": torch.tensor(metadata["spatial_shape"], dtype=torch.int32),
                 "dct_chroma_shape": torch.tensor(metadata["chroma_shape"], dtype=torch.int32),
                 "dct_luma_grid": torch.tensor(metadata["luma_grid_shape"], dtype=torch.int32),
                 "dct_chroma_grid": torch.tensor(metadata["chroma_grid_shape"], dtype=torch.int32),
-                "dct_coeff_window": int(metadata["coeff_window"]),
+                "dct_coeff_window": coeff_window,
+                "dct_coeff_window_luma": coeff_window_luma,
+                "dct_coeff_window_chroma": coeff_window_chroma,
+                "dct_coeff_window_cb": coeff_window_cb,
+                "dct_coeff_window_cr": coeff_window_cr,
+                "dct_coeff_count": coeff_count,
+                "dct_coeff_count_luma": coeff_count_luma,
+                "dct_coeff_count_chroma": coeff_count_chroma,
+                "dct_coeff_count_cb": coeff_count_cb,
+                "dct_coeff_count_cr": coeff_count_cr,
+                "dct_active_coeff_luma": int(metadata["active_coefficients_luma"]),
+                "dct_active_coeff_chroma": int(metadata["active_coefficients_chroma"]),
+                "dct_active_coeff_cb": int(metadata["active_coefficients_cb"]),
+                "dct_active_coeff_cr": int(metadata["active_coefficients_cr"]),
             })
 
         if self.keep_original:
@@ -346,30 +465,80 @@ class CompressToDCT(T.Transform):
 
 
 class TrimDCTCoefficients(T.Transform):
-    """Reduce DCT payload depth to coeff_window² active coefficients."""
+    """Reduce DCT payload depth to the requested active coefficients per plane."""
 
-    def __init__(self, coeff_window: int) -> None:
+    def __init__(
+        self,
+        coeff_count_luma: int,
+        coeff_count_chroma: int | None = None,
+        *,
+        coeff_count_cb: int | None = None,
+        coeff_count_cr: int | None = None,
+    ) -> None:
         super().__init__()
-        if coeff_window not in (1, 2, 4, 8):
-            raise ValueError(f"Unsupported coeff_window: {coeff_window}")
-        self.coeff_window = coeff_window
-        active_idx = _build_active_index(coeff_window)
-        self.active_idx = active_idx
+        self.coeff_count_luma = validate_coeff_count(coeff_count_luma, name="coeff_count_luma")
+        chroma_fallback = coeff_count_luma if coeff_count_chroma is None else coeff_count_chroma
+        cb_count = chroma_fallback if coeff_count_cb is None else coeff_count_cb
+        cr_count = chroma_fallback if coeff_count_cr is None else coeff_count_cr
+        self.coeff_count_cb = validate_coeff_count(cb_count, name="coeff_count_cb")
+        self.coeff_count_cr = validate_coeff_count(cr_count, name="coeff_count_cr")
+        self.coeff_count_chroma = (
+            self.coeff_count_cb
+            if self.coeff_count_cb == self.coeff_count_cr
+            else max(self.coeff_count_cb, self.coeff_count_cr)
+        )
+        self.luma_channels = self.coeff_count_luma
+        self.chroma_channels_cb = self.coeff_count_cb
+        self.chroma_channels_cr = self.coeff_count_cr
+        self.chroma_channels = max(self.coeff_count_cb, self.coeff_count_cr)
+        self.active_idx_luma = _build_active_index(self.coeff_count_luma)
+        self.active_idx_cb = _build_active_index(self.coeff_count_cb)
+        self.active_idx_cr = _build_active_index(self.coeff_count_cr)
 
-    def _trim_pair(self, y_blocks: torch.Tensor, cbcr_blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.active_idx is None or y_blocks.size(0) <= self.coeff_window * self.coeff_window:
-            return y_blocks, cbcr_blocks
-        idx = torch.as_tensor(self.active_idx, dtype=torch.long, device=y_blocks.device)
-        y_trim = torch.index_select(y_blocks, 0, idx)
-        cb = torch.index_select(cbcr_blocks[0], 0, idx)
-        cr = torch.index_select(cbcr_blocks[1], 0, idx)
-        cbcr_trim = torch.stack((cb, cr), dim=0)
-        return y_trim, cbcr_trim
+    def _trim_pair(
+        self,
+        y_blocks: torch.Tensor,
+        cbcr_blocks: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        y_trim = y_blocks
+        if self.active_idx_luma is not None and y_blocks.size(0) > self.luma_channels:
+            idx = torch.as_tensor(self.active_idx_luma, dtype=torch.long, device=y_blocks.device)
+            y_trim = torch.index_select(y_blocks, 0, idx)
+
+        cb, cr = cbcr_blocks
+        if self.active_idx_cb is not None and cb.size(0) > self.chroma_channels_cb:
+            idx_cb = torch.as_tensor(self.active_idx_cb, dtype=torch.long, device=cb.device)
+            cb = torch.index_select(cb, 0, idx_cb)
+        if self.active_idx_cr is not None and cr.size(0) > self.chroma_channels_cr:
+            idx_cr = torch.as_tensor(self.active_idx_cr, dtype=torch.long, device=cr.device)
+            cr = torch.index_select(cr, 0, idx_cr)
+
+        if y_trim.size(0) != self.luma_channels:
+            raise ValueError(
+                f"Expected {self.luma_channels} luma coefficients, received {y_trim.size(0)}."
+            )
+        if cb.size(0) != self.chroma_channels_cb:
+            raise ValueError(
+                f"Expected {self.chroma_channels_cb} Cb coefficients, received {cb.size(0)}."
+            )
+        if cr.size(0) != self.chroma_channels_cr:
+            raise ValueError(
+                f"Expected {self.chroma_channels_cr} Cr coefficients, received {cr.size(0)}."
+            )
+
+        if self.chroma_channels_cb != self.chroma_channels_cr:
+            cb = cb[: self.chroma_channels_cb]
+            cr = cr[: self.chroma_channels_cr]
+        else:
+            cb = cb[: self.chroma_channels]
+            cr = cr[: self.chroma_channels]
+
+        return y_trim, (cb, cr)
 
     def _trim_payload(self, payload):
         if isinstance(payload, tuple) and len(payload) == 2:
             first, second = payload
-            if torch.is_tensor(first) and torch.is_tensor(second):
+            if torch.is_tensor(first) and isinstance(second, tuple):
                 return self._trim_pair(first, second)
             trimmed_first = self._trim_payload(first)
             return trimmed_first, second
@@ -420,9 +589,76 @@ def main(argv: RangeMode | None = None) -> int:
         "--coeff-window",
         dest="coeff_window",
         type=int,
-        choices=[1, 2, 4, 8],
-        default=8,
-        help="Size of the preserved low-frequency window per block (default: 8).",
+        choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        default=None,
+        help="Deprecated square window of low-frequency coefficients to retain (defaults to all coefficients).",
+    )
+    parser.add_argument(
+        "--coeff-window-luma",
+        dest="coeff_window_luma",
+        type=int,
+        choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        default=None,
+        help="Deprecated override for the luma window (defaults to --coeff-window).",
+    )
+    parser.add_argument(
+        "--coeff-window-chroma",
+        dest="coeff_window_chroma",
+        type=int,
+        choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        default=None,
+        help="Deprecated override for the chroma window (defaults to --coeff-window).",
+    )
+    parser.add_argument(
+        "--coeff-window-cb",
+        dest="coeff_window_cb",
+        type=int,
+        choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        default=None,
+        help="Override the Cb coefficient window (defaults to chroma window).",
+    )
+    parser.add_argument(
+        "--coeff-window-cr",
+        dest="coeff_window_cr",
+        type=int,
+        choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        default=None,
+        help="Override the Cr coefficient window (defaults to chroma window).",
+    )
+    parser.add_argument(
+        "--coeff-count",
+        dest="coeff_count",
+        type=_parse_coeff_count,
+        default=None,
+        help="Total number of coefficients per luma block to preserve (default: 64).",
+    )
+    parser.add_argument(
+        "--coeff-count-luma",
+        dest="coeff_count_luma",
+        type=_parse_coeff_count,
+        default=None,
+        help="Override the luma coefficient count (defaults to --coeff-count).",
+    )
+    parser.add_argument(
+        "--coeff-count-chroma",
+        dest="coeff_count_chroma",
+        type=_parse_coeff_count,
+        default=None,
+        help="Override the chroma coefficient count (defaults to luma count).",
+    )
+    parser.add_argument(
+        "--coeff-count-cb",
+        dest="coeff_count_cb",
+        type=_parse_coeff_count,
+        default=None,
+        help="Override the Cb coefficient count (defaults to chroma count).",
+    )
+    parser.add_argument(
+        "--coeff-count-cr",
+        dest="coeff_count_cr",
+        type=_parse_coeff_count,
+        default=None,
+        help="Override the Cr coefficient count (defaults to chroma count).",
     )
     parser.add_argument(
         "--print-only",
@@ -444,15 +680,48 @@ def main(argv: RangeMode | None = None) -> int:
 
     compressed_paths: list[Path] = []
     for image_path in _iter_image_paths(args.images):
-        result = compress_reference_image(image_path, args.range_mode, args.coeff_window)
+        try:
+            _, coeff_count_luma, coeff_count_cb, coeff_count_cr = resolve_coefficient_counts(
+                coeff_window=args.coeff_window,
+                coeff_count=args.coeff_count,
+                coeff_window_luma=args.coeff_window_luma,
+                coeff_count_luma=args.coeff_count_luma,
+                coeff_window_chroma=args.coeff_window_chroma,
+                coeff_count_chroma=args.coeff_count_chroma,
+                coeff_window_cb=args.coeff_window_cb,
+                coeff_window_cr=args.coeff_window_cr,
+                coeff_count_cb=args.coeff_count_cb,
+                coeff_count_cr=args.coeff_count_cr,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Invalid coefficient selection: {exc}") from exc
+
+        result = compress_reference_image(
+            image_path,
+            args.range_mode,
+            coeff_count_luma,
+            coeff_count_cb,
+            coeff_count_cr,
+        )
         luma_shape = result["luma_blocks"].shape
         cb_shape = result["cb_blocks"].shape
         cr_shape = result["cr_blocks"].shape
         coeff_per_block = int(result["coefficients_per_block"].item())
-        active_coeff = int(result.get("active_coefficients", args.coeff_window * args.coeff_window))
+        active_luma = int(result.get("active_coefficients_luma", coeff_count_luma))
+        active_cb = int(result.get("active_coefficients_cb", coeff_count_cb))
+        active_cr = int(result.get("active_coefficients_cr", coeff_count_cr))
+        window_luma = count_to_window(coeff_count_luma)
+        window_cb = count_to_window(coeff_count_cb)
+        window_cr = count_to_window(coeff_count_cr)
+        window_luma_str = f"{window_luma}x{window_luma}" if window_luma is not None else "n/a"
+        window_cb_str = f"{window_cb}x{window_cb}" if window_cb is not None else "n/a"
+        window_cr_str = f"{window_cr}x{window_cr}" if window_cr is not None else "n/a"
         print(
-            f"{image_path}: coeff_window={args.coeff_window}, coeffs/block={coeff_per_block}, "
-            f"active={active_coeff}, Y{luma_shape}, Cb{cb_shape}, Cr{cr_shape}"
+            f"{image_path}: coeff_count_luma={coeff_count_luma} (window {window_luma_str}), "
+            f"coeff_count_cb={coeff_count_cb} (window {window_cb_str}), "
+            f"coeff_count_cr={coeff_count_cr} (window {window_cr_str}), "
+            f"coeffs/block={coeff_per_block}, active(Y)={active_luma}, active(Cb)={active_cb}, active(Cr)={active_cr}, "
+            f"Y{luma_shape}, Cb{cb_shape}, Cr{cr_shape}"
         )
         if args.print_only:
             continue

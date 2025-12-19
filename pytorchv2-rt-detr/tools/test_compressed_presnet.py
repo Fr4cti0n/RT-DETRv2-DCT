@@ -19,6 +19,7 @@ from src.nn.backbone.train_backbones import build_model, _IMAGENET_MEAN, _IMAGEN
 from src.nn.backbone.compressed_presnet import build_compressed_backbone
 from src.data.transforms.compress_reference_images import CompressToDCT
 from src.nn.arch.classification import ClassHead
+from src.misc.dct_coefficients import resolve_coefficient_counts
 
 try:  # Optional dependency for FLOP accounting
     from fvcore.nn import FlopCountAnalysis  # type: ignore
@@ -85,13 +86,22 @@ def _ensure_multiple_of(values: Iterable[int], divisor: int = 8) -> List[int]:
 
 def build_wrapped_model(device: torch.device, range_mode: str, variant: str, coeff_window: int) -> torch.nn.Module:
     model, _ = build_model("resnet34", num_classes=1000)
+    _, coeff_count_luma, coeff_count_cb, coeff_count_cr = resolve_coefficient_counts(
+        coeff_window=coeff_window,
+    )
+    coeff_count_chroma = coeff_count_cb if coeff_count_cb == coeff_count_cr else max(coeff_count_cb, coeff_count_cr)
     model.backbone = build_compressed_backbone(
         variant,
         model.backbone,
         range_mode=range_mode,
         mean=_IMAGENET_MEAN,
         std=_IMAGENET_STD,
-        coeff_window=coeff_window,
+        coeff_window_luma=coeff_window,
+        coeff_window_chroma=coeff_window,
+        coeff_count_luma=coeff_count_luma,
+        coeff_count_chroma=coeff_count_chroma,
+        coeff_count_cb=coeff_count_cb,
+        coeff_count_cr=coeff_count_cr,
     )
     if variant == "luma-fusion-pruned":
         hidden_dim = model.backbone.out_channels[0]

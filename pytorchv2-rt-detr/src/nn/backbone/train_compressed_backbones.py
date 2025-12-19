@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - optional dependency
 from ...data.dataset.imagenet import ImageNetDataset
 from ...data.dataset.subset import limit_total
 from ...data.transforms.dct_normalize import NormalizeDCTCoefficients
+from ...misc.dct_coefficients import resolve_coefficient_config
 from ..arch.classification import ClassHead
 from .compressed_presnet import build_compressed_backbone
 from .inference_benchmark import (
@@ -70,6 +71,26 @@ def _describe_inputs(nested) -> str:
     return repr(type(nested))
 
 
+def _parse_coeff_window(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:  # pragma: no cover - argparse already handles format errors
+        raise argparse.ArgumentTypeError("coefficient window must be an integer") from exc
+    if not 1 <= parsed <= 8:
+        raise argparse.ArgumentTypeError("coefficient window must be within [1, 8]")
+    return parsed
+
+
+def _parse_coeff_count(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("coefficient count must be an integer") from exc
+    if not 0 <= parsed <= 64:
+        raise argparse.ArgumentTypeError("coefficient count must be within [0, 64]")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-dirs", nargs="+", required=True,
@@ -87,9 +108,28 @@ def parse_args() -> argparse.Namespace:
                         help="Minimum learning rate placeholder (unused with step schedule; retained for CLI compatibility).")
     parser.add_argument("--warmup-epochs", type=int, default=0,
                         help="Number of linear warmup epochs applied before cosine decay.")
-    parser.add_argument("--coeff-window", type=int, choices=[1, 2, 4, 8], default=4)
+    parser.add_argument("--coeff-window", type=_parse_coeff_window, default=None,
+                        help="Deprecated square window of lowest-frequency coefficients (defaults to all coefficients).")
+    parser.add_argument("--coeff-window-luma", type=_parse_coeff_window, default=None,
+                        help="Deprecated override for the luma window (defaults to --coeff-window).")
+    parser.add_argument("--coeff-window-chroma", type=_parse_coeff_window, default=None,
+                        help="Deprecated override for the chroma window (defaults to --coeff-window).")
+    parser.add_argument("--coeff-window-cb", type=_parse_coeff_window, default=None,
+                        help="Override the Cb coefficient window (defaults to chroma window).")
+    parser.add_argument("--coeff-window-cr", type=_parse_coeff_window, default=None,
+                        help="Override the Cr coefficient window (defaults to chroma window).")
+    parser.add_argument("--coeff-count", type=_parse_coeff_count, default=None,
+                        help="Total number of luma coefficients per block to retain (default: 64).")
+    parser.add_argument("--coeff-count-luma", type=_parse_coeff_count, default=None,
+                        help="Override the luma coefficient count (defaults to --coeff-count).")
+    parser.add_argument("--coeff-count-chroma", type=_parse_coeff_count, default=None,
+                        help="Override the chroma coefficient count (defaults to luma count).")
+    parser.add_argument("--coeff-count-cb", type=_parse_coeff_count, default=None,
+                        help="Override the Cb coefficient count (defaults to chroma count).")
+    parser.add_argument("--coeff-count-cr", type=_parse_coeff_count, default=None,
+                        help="Override the Cr coefficient count (defaults to chroma count).")
     parser.add_argument("--trim-coefficients", action=argparse.BooleanOptionalAction, default=True,
-                        help="Reduce DCT payload depth to coeff_window^2 channels (use --no-trim-coefficients to keep 64).")
+                        help="Reduce DCT payload depth to the configured coefficient counts (use --no-trim-coefficients to keep 64).")
     parser.add_argument("--range-mode", choices=["studio", "full"], default="studio")
     parser.add_argument(
         "--variant",
@@ -170,6 +210,28 @@ def parse_args() -> argparse.Namespace:
     if args.variant == "reconstruction" and args.trim_coefficients:
         print("[cli] Reconstruction variant requires full coefficient depth; disabling coefficient trimming.")
         args.trim_coefficients = False
+    coeff_cfg = resolve_coefficient_config(
+        coeff_window=args.coeff_window,
+        coeff_count=args.coeff_count,
+        coeff_window_luma=args.coeff_window_luma,
+        coeff_count_luma=args.coeff_count_luma,
+        coeff_window_chroma=args.coeff_window_chroma,
+        coeff_count_chroma=args.coeff_count_chroma,
+        coeff_window_cb=args.coeff_window_cb,
+        coeff_window_cr=args.coeff_window_cr,
+        coeff_count_cb=args.coeff_count_cb,
+        coeff_count_cr=args.coeff_count_cr,
+    )
+    args.coeff_count = coeff_cfg["coeff_count"]
+    args.coeff_count_luma = coeff_cfg["coeff_count_luma"]
+    args.coeff_count_chroma = coeff_cfg["coeff_count_chroma"]
+    args.coeff_count_cb = coeff_cfg["coeff_count_cb"]
+    args.coeff_count_cr = coeff_cfg["coeff_count_cr"]
+    args.coeff_window = coeff_cfg["coeff_window"]
+    args.coeff_window_luma = coeff_cfg["coeff_window_luma"]
+    args.coeff_window_chroma = coeff_cfg["coeff_window_chroma"]
+    args.coeff_window_cb = coeff_cfg["coeff_window_cb"]
+    args.coeff_window_cr = coeff_cfg["coeff_window_cr"]
     return args
 
 
@@ -456,6 +518,15 @@ def main() -> None:
 
     compression_cfg = {
         "coeff_window": args.coeff_window,
+        "coeff_window_luma": args.coeff_window_luma,
+        "coeff_window_chroma": args.coeff_window_chroma,
+        "coeff_window_cb": args.coeff_window_cb,
+        "coeff_window_cr": args.coeff_window_cr,
+        "coeff_count": args.coeff_count,
+        "coeff_count_luma": args.coeff_count_luma,
+        "coeff_count_chroma": args.coeff_count_chroma,
+        "coeff_count_cb": args.coeff_count_cb,
+        "coeff_count_cr": args.coeff_count_cr,
         "range_mode": args.range_mode,
         "dtype": torch.float32,
         "keep_original": False,
@@ -470,9 +541,39 @@ def main() -> None:
         stats_path_input = None
     else:
         if stats_path_input is None:
-            default_stats = Path("configs/dct_stats") / f"imagenet_coeff{args.coeff_window}_{args.range_mode}.pt"
-            if default_stats.exists():
-                stats_path_input = default_stats
+            candidate_windows: list[int] = []
+            for window in (
+                args.coeff_window_luma,
+                args.coeff_window_cb,
+                args.coeff_window_cr,
+                args.coeff_window_chroma,
+            ):
+                if isinstance(window, int) and 1 <= window <= 8 and window not in candidate_windows:
+                    candidate_windows.append(window)
+            if 8 not in candidate_windows:
+                candidate_windows.append(8)
+            for candidate_window in candidate_windows:
+                default_stats = Path("configs/dct_stats") / f"imagenet_coeff{candidate_window}_{args.range_mode}.pt"
+                if default_stats.exists():
+                    requested_windows = {
+                        w
+                        for w in (
+                            args.coeff_window_luma,
+                            args.coeff_window_cb,
+                            args.coeff_window_cr,
+                            args.coeff_window_chroma,
+                        )
+                        if isinstance(w, int)
+                    }
+                    if any(w != candidate_window for w in requested_windows):
+                        print(
+                            f"Using DCT stats computed for coeff window {candidate_window}; "
+                            "requested windows will slice the relevant coefficients."
+                        )
+                    stats_path_input = default_stats
+                    break
+            if stats_path_input is None:
+                print("No default DCT stats file found; skipping normalisation auto-detection.")
     stats_path_resolved: Path | None = None
     if stats_path_input is not None:
         try:
@@ -480,10 +581,28 @@ def main() -> None:
             normalizer_train = NormalizeDCTCoefficients.from_file(
                 stats_path_resolved,
                 coeff_window=args.coeff_window,
+                coeff_window_luma=args.coeff_window_luma,
+                coeff_window_chroma=args.coeff_window_chroma,
+                coeff_window_cb=args.coeff_window_cb,
+                coeff_window_cr=args.coeff_window_cr,
+                coeff_count=args.coeff_count,
+                coeff_count_luma=args.coeff_count_luma,
+                coeff_count_chroma=args.coeff_count_chroma,
+                coeff_count_cb=args.coeff_count_cb,
+                coeff_count_cr=args.coeff_count_cr,
             )
             normalizer_val = NormalizeDCTCoefficients.from_file(
                 stats_path_resolved,
                 coeff_window=args.coeff_window,
+                coeff_window_luma=args.coeff_window_luma,
+                coeff_window_chroma=args.coeff_window_chroma,
+                coeff_window_cb=args.coeff_window_cb,
+                coeff_window_cr=args.coeff_window_cr,
+                coeff_count=args.coeff_count,
+                coeff_count_luma=args.coeff_count_luma,
+                coeff_count_chroma=args.coeff_count_chroma,
+                coeff_count_cb=args.coeff_count_cb,
+                coeff_count_cr=args.coeff_count_cr,
             )
             print(f"Loaded DCT coefficient statistics from {stats_path_resolved}")
         except Exception as exc:  # pragma: no cover - safeguard for user-provided files
@@ -527,7 +646,12 @@ def main() -> None:
     time_limit_seconds = time_limit_hours * 3600.0 if time_limit_hours is not None else None
 
     timestamp_tag = time.strftime("%Y%m%d-%H%M%S")
-    proposed_run_subdir = f"{args.variant}_coeff{args.coeff_window}_{timestamp_tag}"
+    window_tag = f"coeffY{args.coeff_count_luma}"
+    if args.coeff_count_cb == args.coeff_count_cr:
+        window_tag += f"_CbCr{args.coeff_count_cb}"
+    else:
+        window_tag += f"_Cb{args.coeff_count_cb}_Cr{args.coeff_count_cr}"
+    proposed_run_subdir = f"{args.variant}_{window_tag}_{timestamp_tag}"
     run_subdir_name = proposed_run_subdir
     if args.resume is not None:
         resume_hint = args.resume.expanduser()
@@ -543,7 +667,14 @@ def main() -> None:
         range_mode=args.range_mode,
         mean=_IMAGENET_MEAN,
         std=_IMAGENET_STD,
-        coeff_window=args.coeff_window,
+        coeff_window_luma=args.coeff_window_luma,
+        coeff_window_chroma=args.coeff_window_chroma,
+        coeff_window_cb=args.coeff_window_cb,
+        coeff_window_cr=args.coeff_window_cr,
+        coeff_count_luma=args.coeff_count_luma,
+        coeff_count_chroma=args.coeff_count_chroma,
+        coeff_count_cb=args.coeff_count_cb,
+        coeff_count_cr=args.coeff_count_cr,
     )
     if args.variant == "luma-fusion-pruned":
         hidden_dim = model.backbone.out_channels[0]
@@ -592,7 +723,7 @@ def main() -> None:
             auto_resume_source_checkpoint = candidate
             using_existing_run_dir = True
         else:
-            prefix = f"{args.variant}_coeff{args.coeff_window}_"
+            prefix = f"{args.variant}_{window_tag}_"
             existing_dirs: list[Path] = []
             if base_checkpoint_dir.exists():
                 existing_dirs = sorted(
@@ -673,7 +804,9 @@ def main() -> None:
 
         wandb_config = {
             "variant": args.variant,
-            "coeff_window": args.coeff_window,
+            "coeff_window": args.coeff_window_luma,
+            "coeff_window_luma": args.coeff_window_luma,
+            "coeff_window_chroma": args.coeff_window_chroma,
             "trim_coefficients": args.trim_coefficients,
             "range_mode": args.range_mode,
             "image_size": args.image_size,
@@ -720,7 +853,9 @@ def main() -> None:
         timestamp_now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         params_to_record = {
             "variant": args.variant,
-            "coeff_window": args.coeff_window,
+            "coeff_window": args.coeff_window_luma,
+            "coeff_window_luma": args.coeff_window_luma,
+            "coeff_window_chroma": args.coeff_window_chroma,
             "range_mode": args.range_mode,
             "trim_coefficients": args.trim_coefficients,
             "image_size": args.image_size,
@@ -912,7 +1047,9 @@ def main() -> None:
                             "scheduler": scheduler.state_dict(),
                             "scaler": scaler.state_dict() if scaler is not None else None,
                             "variant": args.variant,
-                            "coeff_window": args.coeff_window,
+                            "coeff_window": args.coeff_window_luma,
+                            "coeff_window_luma": args.coeff_window_luma,
+                            "coeff_window_chroma": args.coeff_window_chroma,
                             "range_mode": args.range_mode,
                             "best_acc": best_acc,
                         },
@@ -928,7 +1065,9 @@ def main() -> None:
                         "scheduler": scheduler.state_dict(),
                         "scaler": scaler.state_dict() if scaler is not None else None,
                         "variant": args.variant,
-                        "coeff_window": args.coeff_window,
+                        "coeff_window": args.coeff_window_luma,
+                        "coeff_window_luma": args.coeff_window_luma,
+                        "coeff_window_chroma": args.coeff_window_chroma,
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
                     },
@@ -943,7 +1082,9 @@ def main() -> None:
                         "scheduler": scheduler.state_dict(),
                         "scaler": scaler.state_dict() if scaler is not None else None,
                         "variant": args.variant,
-                        "coeff_window": args.coeff_window,
+                        "coeff_window": args.coeff_window_luma,
+                        "coeff_window_luma": args.coeff_window_luma,
+                        "coeff_window_chroma": args.coeff_window_chroma,
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
                     },
@@ -961,7 +1102,9 @@ def main() -> None:
                 batch_size=args.batch_size,
                 workers=args.workers,
                 compression_cfg=compression_cfg,
-                coeff_window=args.coeff_window,
+                coeff_count_luma=args.coeff_count_luma,
+                coeff_count_cb=args.coeff_count_cb,
+                coeff_count_cr=args.coeff_count_cr,
                 max_samples=args.max_val_images,
                 dct_normalizer=normalizer_val,
                 show_progress=args.show_progress,
@@ -992,7 +1135,8 @@ def main() -> None:
                 result = run_trimmed_inference_benchmark(
                     model,
                     device=device,
-                    coeff_window=args.coeff_window,
+                    coeff_window_luma=args.coeff_window_luma,
+                    coeff_window_chroma=args.coeff_window_chroma,
                     image_size=args.image_size,
                     batch_size=bench_bs,
                     val_dirs=[str(Path(args.val_dir))],
@@ -1014,7 +1158,9 @@ def main() -> None:
                 benchmark_csv_rows.append({
                     "timestamp": benchmark_timestamp,
                     "variant": args.variant,
-                    "coeff_window": args.coeff_window,
+                    "coeff_window": args.coeff_window_luma,
+                    "coeff_window_luma": args.coeff_window_luma,
+                    "coeff_window_chroma": args.coeff_window_chroma,
                     "image_size": args.image_size,
                     "batch_size": bench_bs,
                     "samples": result.samples,
@@ -1024,6 +1170,9 @@ def main() -> None:
                     "input_mb_per_batch": result.input_mb_per_batch,
                     "peak_memory_mb": result.peak_memory_mb,
                     "coeff_channels": result.coeff_channels,
+                    "coeff_channels_cb": result.coeff_channels_cb,
+                    "coeff_channels_cr": result.coeff_channels_cr,
+                    "coeff_channels_chroma": result.coeff_channels_chroma,
                     "val_loss": result.loss if result.loss is not None else "",
                     "val_acc1": result.acc1 if result.acc1 is not None else "",
                     "val_acc5": result.acc5 if result.acc5 is not None else "",
@@ -1036,6 +1185,8 @@ def main() -> None:
             "timestamp",
             "variant",
             "coeff_window",
+            "coeff_window_luma",
+            "coeff_window_chroma",
             "image_size",
             "batch_size",
             "samples",
@@ -1045,6 +1196,9 @@ def main() -> None:
             "input_mb_per_batch",
             "peak_memory_mb",
             "coeff_channels",
+            "coeff_channels_cb",
+            "coeff_channels_cr",
+            "coeff_channels_chroma",
             "val_loss",
             "val_acc1",
             "val_acc5",
@@ -1090,7 +1244,7 @@ def main() -> None:
             f"[benchmark] trimmed inference (bs={batch_size}): "
             f"{benchmark_result.throughput_img_s:.2f} img/s | "
             f"{benchmark_result.mean_latency_ms:.2f} ms/batch | "
-            f"coeffs={benchmark_result.coeff_channels} | "
+            f"coeffs=Y{benchmark_result.coeff_channels}/Cb{benchmark_result.coeff_channels_cb}/Cr{benchmark_result.coeff_channels_cr} | "
             f"input={benchmark_result.input_mb_per_batch:.2f} MB/batch"
             f"{peak_text}{metrics_text}"
         )
@@ -1102,6 +1256,9 @@ def main() -> None:
                 f"benchmark/bs{batch_size}/mean_latency_ms": benchmark_result.mean_latency_ms,
                 f"benchmark/bs{batch_size}/input_mb_per_batch": benchmark_result.input_mb_per_batch,
                 f"benchmark/bs{batch_size}/coeff_channels": benchmark_result.coeff_channels,
+                f"benchmark/bs{batch_size}/coeff_channels_cb": benchmark_result.coeff_channels_cb,
+                f"benchmark/bs{batch_size}/coeff_channels_cr": benchmark_result.coeff_channels_cr,
+                f"benchmark/bs{batch_size}/coeff_channels_chroma": benchmark_result.coeff_channels_chroma,
                 f"benchmark/bs{batch_size}/peak_memory_mb": benchmark_result.peak_memory_mb,
                 f"benchmark/bs{batch_size}/val_loss": benchmark_result.loss,
                 f"benchmark/bs{batch_size}/val_acc1": benchmark_result.acc1,

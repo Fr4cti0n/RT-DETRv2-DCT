@@ -20,6 +20,7 @@ from src.nn.backbone.train_backbones import build_model, _IMAGENET_MEAN, _IMAGEN
 from src.nn.backbone.compressed_presnet import build_compressed_backbone
 from src.data.transforms.compress_reference_images import CompressToDCT
 from src.nn.arch.classification import ClassHead
+from src.misc.dct_coefficients import resolve_coefficient_counts
 
 try:  # Optional dependency for FLOP accounting
     from fvcore.nn import FlopCountAnalysis  # type: ignore
@@ -96,13 +97,23 @@ def _build_model(variant: str, range_mode: str, coeff_window: int | None) -> tor
     if variant == "rgb-standard":
         return model
     compressed_variant = variant
+    window = coeff_window or 8
+    _, coeff_count_luma, coeff_count_cb, coeff_count_cr = resolve_coefficient_counts(
+        coeff_window=window,
+    )
+    coeff_count_chroma = coeff_count_cb if coeff_count_cb == coeff_count_cr else max(coeff_count_cb, coeff_count_cr)
     model.backbone = build_compressed_backbone(
         compressed_variant,
         model.backbone,
         range_mode=range_mode,
         mean=_IMAGENET_MEAN,
         std=_IMAGENET_STD,
-        coeff_window=coeff_window or 8,
+        coeff_window_luma=window,
+        coeff_window_chroma=window,
+        coeff_count_luma=coeff_count_luma,
+        coeff_count_chroma=coeff_count_chroma,
+        coeff_count_cb=coeff_count_cb,
+        coeff_count_cr=coeff_count_cr,
     )
     if compressed_variant == "luma-fusion-pruned":
         hidden_dim = model.backbone.out_channels[0]

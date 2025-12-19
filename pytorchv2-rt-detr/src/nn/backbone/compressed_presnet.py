@@ -16,6 +16,12 @@ from .presnet import (
     BottleNeck,
 )
 from ...core import register
+from ...misc.dct_coefficients import (
+    build_active_indices,
+    count_to_window,
+    resolve_coefficient_counts,
+    validate_coeff_count,
+)
 
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -64,17 +70,33 @@ class _DCTBlockDecoder(nn.Module):
         return spatial
 
 
-def _unpack_payload(payload) -> Tuple[torch.Tensor, torch.Tensor]:
+def _unpack_payload(payload) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if isinstance(payload, (list, tuple)):
-        if len(payload) == 2 and isinstance(payload[0], (list, tuple)):
-            payload = payload[0]
-        if len(payload) == 2 and all(isinstance(p, torch.Tensor) for p in payload):
-            return payload[0], payload[1]
-    raise TypeError("Expected (y_blocks, cbcr_blocks) tuple from CompressToDCT.")
+        if len(payload) == 2 and isinstance(payload[0], (list, tuple)) and not torch.is_tensor(payload[0]):
+            return _unpack_payload(payload[0])
+        if (
+            len(payload) == 2
+            and torch.is_tensor(payload[0])
+            and isinstance(payload[1], (list, tuple))
+            and len(payload[1]) == 2
+            and all(torch.is_tensor(item) for item in payload[1])
+        ):
+            return payload[0], (payload[1][0], payload[1][1])
+    raise TypeError("Expected (y_blocks, (cb_blocks, cr_blocks)) tuple from CompressToDCT.")
 
 
 def _upsample_chroma(chroma: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
     return F.interpolate(chroma, size=target_hw, mode="bilinear", align_corners=False)
+
+
+def _build_active_index_from_count(coeff_count: int) -> torch.Tensor | None:
+    count = validate_coeff_count(coeff_count, name="coeff_count")
+    if count >= 64:
+        return None
+    indices = build_active_indices(count)
+    if not indices:
+        return torch.empty(0, dtype=torch.long)
+    return torch.tensor(indices, dtype=torch.long)
 
 
 class _BackboneAdapter(nn.Module):
@@ -101,12 +123,29 @@ class _BackboneAdapter(nn.Module):
                 outs.append(x)
         return outs
 
-
-def _build_active_index(coeff_window: int) -> torch.Tensor | None:
-    if coeff_window >= 8:
-        return None
-    indices = [row + col * 8 for col in range(coeff_window) for row in range(coeff_window)]
-    return torch.tensor(indices, dtype=torch.long)
+    @staticmethod
+    def _select_chroma_plane(
+        plane: torch.Tensor,
+        target_count: int,
+        active_idx: torch.Tensor | None,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        if plane.size(1) > target_count:
+            if active_idx is not None and active_idx.numel() > 0:
+                max_idx = int(active_idx.max().item())
+                if max_idx < plane.size(1):
+                    idx = active_idx.to(device=plane.device)
+                    plane = torch.index_select(plane, 1, idx)
+                else:
+                    plane = plane[:, :target_count]
+            else:
+                plane = plane[:, :target_count]
+        if plane.size(1) > target_count:
+            plane = plane[:, :target_count]
+        if plane.size(1) != target_count:
+            raise ValueError(f"Expected {target_count} {name} coefficients, received {plane.size(1)}.")
+        return plane
 
 
 class CompressedResNetReconstruction(_BackboneAdapter):
@@ -135,12 +174,17 @@ class CompressedResNetReconstruction(_BackboneAdapter):
         self.register_buffer("mean", mean_tensor)
         self.register_buffer("std", std_tensor)
 
-    def _decode_planes(self, y_blocks: torch.Tensor, cbcr_blocks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _decode_planes(
+        self,
+        y_blocks: torch.Tensor,
+        cbcr_blocks: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         y_plane = self.decoder(y_blocks)
-        if cbcr_blocks.dim() != 5 or cbcr_blocks.size(1) != 2:
-            raise ValueError("Chrominance tensor must have shape [B, 2, 64, By, Bx].")
-        cb_plane = self.decoder(cbcr_blocks[:, 0])
-        cr_plane = self.decoder(cbcr_blocks[:, 1])
+        cb_blocks, cr_blocks = cbcr_blocks
+        if cb_blocks.dim() != 4 or cr_blocks.dim() != 4:
+            raise ValueError("Chrominance tensors must have shape [B, C, By, Bx].")
+        cb_plane = self.decoder(cb_blocks)
+        cr_plane = self.decoder(cr_blocks)
         target_hw = y_plane.shape[-2:]
         cb_plane = _upsample_chroma(cb_plane.unsqueeze(1), target_hw).squeeze(1)
         cr_plane = _upsample_chroma(cr_plane.unsqueeze(1), target_hw).squeeze(1)
@@ -165,11 +209,12 @@ class CompressedResNetReconstruction(_BackboneAdapter):
         return rgb / 255.0
 
     def forward(self, inputs):
-        y_blocks, cbcr_blocks = _unpack_payload(inputs)
+        y_blocks, (cb_blocks, cr_blocks) = _unpack_payload(inputs)
         device = self.mean.device
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
-        cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
-        y_plane, cb_plane, cr_plane = self._decode_planes(y_blocks, cbcr_blocks)
+        cb_blocks = cb_blocks.to(device=device, dtype=torch.float32)
+        cr_blocks = cr_blocks.to(device=device, dtype=torch.float32)
+        y_plane, cb_plane, cr_plane = self._decode_planes(y_blocks, (cb_blocks, cr_blocks))
         rgb = self._ycbcr_to_rgb(y_plane, cb_plane, cr_plane)
         refined = self.refine(rgb)
         normalized = (refined - self.mean.to(refined.dtype)) / self.std.to(refined.dtype)
@@ -177,18 +222,60 @@ class CompressedResNetReconstruction(_BackboneAdapter):
 
 
 class CompressedResNetBlockStem(_BackboneAdapter):
-    def __init__(self, backbone: PResNet, coeff_window: int) -> None:
+    def __init__(
+        self,
+        backbone: PResNet,
+        *,
+        coeff_window_luma: int | None = None,
+        coeff_window_chroma: int | None = None,
+        coeff_count_luma: int | None = None,
+        coeff_count_chroma: int | None = None,
+        coeff_window_cb: int | None = None,
+        coeff_window_cr: int | None = None,
+        coeff_count_cb: int | None = None,
+        coeff_count_cr: int | None = None,
+    ) -> None:
         super().__init__(backbone)
-        if coeff_window not in {1, 2, 4, 8}:
-            raise ValueError("coeff_window must be one of {1, 2, 4, 8}.")
-        self.coeff_window = coeff_window
-        self.luma_channels = coeff_window * coeff_window
-        self.chroma_channels = 2 * self.luma_channels
-        active_idx = _build_active_index(coeff_window)
-        if active_idx is not None:
-            self.register_buffer("active_idx", active_idx, persistent=False)
+        _, luma_count, cb_count, cr_count = resolve_coefficient_counts(
+            coeff_window=coeff_window_luma,
+            coeff_count=coeff_count_luma,
+            coeff_window_luma=coeff_window_luma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
+        self.coeff_count_luma = luma_count
+        self.coeff_count_cb = cb_count
+        self.coeff_count_cr = cr_count
+        self.coeff_count_chroma = cb_count if cb_count == cr_count else max(cb_count, cr_count)
+        self.coeff_window_luma = count_to_window(luma_count)
+        window_cb = count_to_window(cb_count)
+        window_cr = count_to_window(cr_count)
+        self.coeff_window_chroma = window_cb if window_cb == window_cr else None
+        self.coeff_window = self.coeff_window_luma
+        self.luma_channels = self.coeff_count_luma
+        self.chroma_channels_cb = self.coeff_count_cb
+        self.chroma_channels_cr = self.coeff_count_cr
+        self.chroma_channels = self.chroma_channels_cb + self.chroma_channels_cr
+        active_idx_luma = _build_active_index_from_count(self.coeff_count_luma)
+        active_idx_cb = _build_active_index_from_count(self.coeff_count_cb)
+        active_idx_cr = _build_active_index_from_count(self.coeff_count_cr)
+        if active_idx_luma is not None:
+            self.register_buffer("active_idx_luma", active_idx_luma, persistent=False)
         else:
-            self.active_idx = None
+            self.active_idx_luma = None
+        if active_idx_cb is not None:
+            self.register_buffer("active_idx_cb", active_idx_cb, persistent=False)
+        else:
+            self.active_idx_cb = None
+        if active_idx_cr is not None:
+            self.register_buffer("active_idx_cr", active_idx_cr, persistent=False)
+        else:
+            self.active_idx_cr = None
         mid_channels = max(self.target_channels, 64)
         self.luma_proj = nn.Sequential(
             nn.Conv2d(self.luma_channels, mid_channels, kernel_size=1, padding=0, bias=False),
@@ -208,21 +295,31 @@ class CompressedResNetBlockStem(_BackboneAdapter):
         )
 
     def forward(self, inputs):
-        y_blocks, cbcr_blocks = _unpack_payload(inputs)
+        y_blocks, (cb_blocks, cr_blocks) = _unpack_payload(inputs)
         device = next(self.parameters()).device
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
-        cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
+        cb_blocks = cb_blocks.to(device=device, dtype=torch.float32)
+        cr_blocks = cr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx is not None and y_blocks.size(1) > self.luma_channels:
-            idx = self.active_idx.to(device)
-            y_blocks = torch.index_select(y_blocks, 1, idx)
-            cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
-            cr = torch.index_select(cbcr_blocks[:, 1], 1, idx)
-        else:
-            cb = cbcr_blocks[:, 0]
-            cr = cbcr_blocks[:, 1]
+        if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
+            idx_luma = self.active_idx_luma.to(device)
+            y_blocks = torch.index_select(y_blocks, 1, idx_luma)
+        elif y_blocks.size(1) != self.luma_channels:
+            raise ValueError(
+                f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
+            )
+
+        cb = cb_blocks
+        cr = cr_blocks
+        cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
+        cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
 
         chroma = torch.cat((cb, cr), dim=1)
+        if chroma.size(1) != self.chroma_channels:
+            raise ValueError(
+                f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
+                f"received {chroma.size(1)}."
+            )
         chroma = F.interpolate(chroma, size=y_blocks.shape[-2:], mode="nearest")
 
         y_feat = self.luma_proj(y_blocks)
@@ -233,18 +330,60 @@ class CompressedResNetBlockStem(_BackboneAdapter):
 
 
 class CompressedResNetLumaFusion(_BackboneAdapter):
-    def __init__(self, backbone: PResNet, coeff_window: int) -> None:
+    def __init__(
+        self,
+        backbone: PResNet,
+        *,
+        coeff_window_luma: int | None = None,
+        coeff_window_chroma: int | None = None,
+        coeff_count_luma: int | None = None,
+        coeff_count_chroma: int | None = None,
+        coeff_window_cb: int | None = None,
+        coeff_window_cr: int | None = None,
+        coeff_count_cb: int | None = None,
+        coeff_count_cr: int | None = None,
+    ) -> None:
         super().__init__(backbone)
-        if coeff_window not in {1, 2, 4, 8}:
-            raise ValueError("coeff_window must be one of {1, 2, 4, 8}.")
-        self.coeff_window = coeff_window
-        self.luma_channels = coeff_window * coeff_window
-        self.chroma_channels = 2 * self.luma_channels
-        active_idx = _build_active_index(coeff_window)
-        if active_idx is not None:
-            self.register_buffer("active_idx", active_idx, persistent=False)
+        _, luma_count, cb_count, cr_count = resolve_coefficient_counts(
+            coeff_window=coeff_window_luma,
+            coeff_count=coeff_count_luma,
+            coeff_window_luma=coeff_window_luma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
+        self.coeff_count_luma = luma_count
+        self.coeff_count_cb = cb_count
+        self.coeff_count_cr = cr_count
+        self.coeff_count_chroma = cb_count if cb_count == cr_count else max(cb_count, cr_count)
+        self.coeff_window_luma = count_to_window(luma_count)
+        window_cb = count_to_window(cb_count)
+        window_cr = count_to_window(cr_count)
+        self.coeff_window_chroma = window_cb if window_cb == window_cr else None
+        self.coeff_window = self.coeff_window_luma
+        self.luma_channels = self.coeff_count_luma
+        self.chroma_channels_cb = self.coeff_count_cb
+        self.chroma_channels_cr = self.coeff_count_cr
+        self.chroma_channels = self.chroma_channels_cb + self.chroma_channels_cr
+        active_idx_luma = _build_active_index_from_count(self.coeff_count_luma)
+        active_idx_cb = _build_active_index_from_count(self.coeff_count_cb)
+        active_idx_cr = _build_active_index_from_count(self.coeff_count_cr)
+        if active_idx_luma is not None:
+            self.register_buffer("active_idx_luma", active_idx_luma, persistent=False)
         else:
-            self.active_idx = None
+            self.active_idx_luma = None
+        if active_idx_cb is not None:
+            self.register_buffer("active_idx_cb", active_idx_cb, persistent=False)
+        else:
+            self.active_idx_cb = None
+        if active_idx_cr is not None:
+            self.register_buffer("active_idx_cr", active_idx_cr, persistent=False)
+        else:
+            self.active_idx_cr = None
         luma_width = max(self.target_channels, 64)
         chroma_width = luma_width // 2
         self.luma_down = nn.Sequential(
@@ -265,22 +404,32 @@ class CompressedResNetLumaFusion(_BackboneAdapter):
         )
 
     def forward(self, inputs):
-        y_blocks, cbcr_blocks = _unpack_payload(inputs)
+        y_blocks, (cb_blocks, cr_blocks) = _unpack_payload(inputs)
         device = next(self.parameters()).device
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
-        cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
+        cb_blocks = cb_blocks.to(device=device, dtype=torch.float32)
+        cr_blocks = cr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx is not None and y_blocks.size(1) > self.luma_channels:
-            idx = self.active_idx.to(device)
-            y_blocks = torch.index_select(y_blocks, 1, idx)
-            cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
-            cr = torch.index_select(cbcr_blocks[:, 1], 1, idx)
-        else:
-            cb = cbcr_blocks[:, 0]
-            cr = cbcr_blocks[:, 1]
+        if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
+            idx_luma = self.active_idx_luma.to(device)
+            y_blocks = torch.index_select(y_blocks, 1, idx_luma)
+        elif y_blocks.size(1) != self.luma_channels:
+            raise ValueError(
+                f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
+            )
+
+        cb = cb_blocks
+        cr = cr_blocks
+        cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
+        cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
 
         luma_feat = self.luma_down(y_blocks)
         chroma = torch.cat((cb, cr), dim=1)
+        if chroma.size(1) != self.chroma_channels:
+            raise ValueError(
+                f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
+                f"received {chroma.size(1)}."
+            )
         chroma_feat = self.chroma_proj(chroma)
         fused = self.fusion(torch.cat((luma_feat, chroma_feat), dim=1))
         conv1_like = F.interpolate(fused, scale_factor=4.0, mode="bilinear", align_corners=False)
@@ -288,19 +437,62 @@ class CompressedResNetLumaFusion(_BackboneAdapter):
 
 
 class CompressedResNetLumaFusionPruned(_BackboneAdapter):
-    def __init__(self, backbone: PResNet, coeff_window: int) -> None:
+    def __init__(
+        self,
+        backbone: PResNet,
+        *,
+        coeff_window_luma: int | None = None,
+        coeff_window_chroma: int | None = None,
+        coeff_count_luma: int | None = None,
+        coeff_count_chroma: int | None = None,
+        coeff_window_cb: int | None = None,
+        coeff_window_cr: int | None = None,
+        coeff_count_cb: int | None = None,
+        coeff_count_cr: int | None = None,
+    ) -> None:
         super().__init__(backbone)
-        if coeff_window not in {1, 2, 4, 8}:
-            raise ValueError("coeff_window must be one of {1, 2, 4, 8}.")
-        scale = max(coeff_window / 8.0, 1.0 / 8.0)
-        self.coeff_window = coeff_window
-        self.luma_channels = coeff_window * coeff_window
-        self.chroma_channels = 2 * self.luma_channels
-        active_idx = _build_active_index(coeff_window)
-        if active_idx is not None:
-            self.register_buffer("active_idx", active_idx, persistent=False)
+        _, luma_count, cb_count, cr_count = resolve_coefficient_counts(
+            coeff_window=coeff_window_luma,
+            coeff_count=coeff_count_luma,
+            coeff_window_luma=coeff_window_luma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
+        self.coeff_count_luma = luma_count
+        self.coeff_count_cb = cb_count
+        self.coeff_count_cr = cr_count
+        self.coeff_count_chroma = cb_count if cb_count == cr_count else max(cb_count, cr_count)
+        self.coeff_window_luma = count_to_window(luma_count)
+        window_cb = count_to_window(cb_count)
+        window_cr = count_to_window(cr_count)
+        self.coeff_window_chroma = window_cb if window_cb == window_cr else None
+        scale_window = max(math.sqrt(luma_count), 1.0)
+        scale = max(scale_window / 8.0, 1.0 / 8.0)
+        self.coeff_window = self.coeff_window_luma
+        self.luma_channels = self.coeff_count_luma
+        self.chroma_channels_cb = self.coeff_count_cb
+        self.chroma_channels_cr = self.coeff_count_cr
+        self.chroma_channels = self.chroma_channels_cb + self.chroma_channels_cr
+        active_idx_luma = _build_active_index_from_count(self.coeff_count_luma)
+        active_idx_cb = _build_active_index_from_count(self.coeff_count_cb)
+        active_idx_cr = _build_active_index_from_count(self.coeff_count_cr)
+        if active_idx_luma is not None:
+            self.register_buffer("active_idx_luma", active_idx_luma, persistent=False)
         else:
-            self.active_idx = None
+            self.active_idx_luma = None
+        if active_idx_cb is not None:
+            self.register_buffer("active_idx_cb", active_idx_cb, persistent=False)
+        else:
+            self.active_idx_cb = None
+        if active_idx_cr is not None:
+            self.register_buffer("active_idx_cr", active_idx_cr, persistent=False)
+        else:
+            self.active_idx_cr = None
         self._shrink_backbone(scale)
         luma_width = max(self.target_channels, 8)
         chroma_width = max(luma_width // 2, 4)
@@ -357,22 +549,32 @@ class CompressedResNetLumaFusionPruned(_BackboneAdapter):
         self.backbone.conv1 = nn.Identity()
 
     def forward(self, inputs):
-        y_blocks, cbcr_blocks = _unpack_payload(inputs)
+        y_blocks, (cb_blocks, cr_blocks) = _unpack_payload(inputs)
         device = next(self.parameters()).device
         y_blocks = y_blocks.to(device=device, dtype=torch.float32)
-        cbcr_blocks = cbcr_blocks.to(device=device, dtype=torch.float32)
+        cb_blocks = cb_blocks.to(device=device, dtype=torch.float32)
+        cr_blocks = cr_blocks.to(device=device, dtype=torch.float32)
 
-        if self.active_idx is not None and y_blocks.size(1) > self.luma_channels:
-            idx = self.active_idx.to(device)
-            y_blocks = torch.index_select(y_blocks, 1, idx)
-            cb = torch.index_select(cbcr_blocks[:, 0], 1, idx)
-            cr = torch.index_select(cbcr_blocks[:, 1], 1, idx)
-        else:
-            cb = cbcr_blocks[:, 0]
-            cr = cbcr_blocks[:, 1]
+        if self.active_idx_luma is not None and y_blocks.size(1) > self.luma_channels:
+            idx_luma = self.active_idx_luma.to(device)
+            y_blocks = torch.index_select(y_blocks, 1, idx_luma)
+        elif y_blocks.size(1) != self.luma_channels:
+            raise ValueError(
+                f"Expected {self.luma_channels} luma coefficients, received {y_blocks.size(1)}."
+            )
+
+        cb = cb_blocks
+        cr = cr_blocks
+        cb = self._select_chroma_plane(cb, self.chroma_channels_cb, getattr(self, "active_idx_cb", None), name="Cb")
+        cr = self._select_chroma_plane(cr, self.chroma_channels_cr, getattr(self, "active_idx_cr", None), name="Cr")
 
         luma_feat = self.luma_down(y_blocks)
         chroma = torch.cat((cb, cr), dim=1)
+        if chroma.size(1) != self.chroma_channels:
+            raise ValueError(
+                f"Expected concatenated chroma tensor with {self.chroma_channels} channels, "
+                f"received {chroma.size(1)}."
+            )
         chroma_feat = self.chroma_proj(chroma)
         fused = self.fusion(torch.cat((luma_feat, chroma_feat), dim=1))
         conv1_like = F.interpolate(fused, scale_factor=4.0, mode="bilinear", align_corners=False)
@@ -392,6 +594,15 @@ class CompressedPResNet(nn.Module):
             "luma-fusion-pruned",
         ],
         coeff_window: int = 8,
+        coeff_window_luma: int | None = None,
+        coeff_window_chroma: int | None = None,
+        coeff_window_cb: int | None = None,
+        coeff_window_cr: int | None = None,
+        coeff_count: int | None = None,
+        coeff_count_luma: int | None = None,
+        coeff_count_chroma: int | None = None,
+        coeff_count_cb: int | None = None,
+        coeff_count_cr: int | None = None,
         range_mode: str = "studio",
         mean: Sequence[float] = _IMAGENET_MEAN,
         std: Sequence[float] = _IMAGENET_STD,
@@ -404,14 +615,47 @@ class CompressedPResNet(nn.Module):
         base_pretrained = backbone_kwargs.pop("pretrained", False)
 
         backbone = PResNet(pretrained=base_pretrained, **backbone_kwargs)
+        _, luma_count, cb_count, cr_count = resolve_coefficient_counts(
+            coeff_window=coeff_window,
+            coeff_count=coeff_count,
+            coeff_window_luma=coeff_window_luma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
+        window_luma = count_to_window(luma_count)
+        window_cb = count_to_window(cb_count)
+        window_cr = count_to_window(cr_count)
+        window_chroma = window_cb if window_cb == window_cr else None
+        chroma_count = cb_count if cb_count == cr_count else max(cb_count, cr_count)
         self.backbone = build_compressed_backbone(
             compression_variant,
             backbone,
             range_mode=range_mode,
             mean=mean,
             std=std,
-            coeff_window=coeff_window,
+            coeff_window_luma=window_luma,
+            coeff_window_chroma=window_chroma,
+            coeff_count_luma=luma_count,
+            coeff_count_chroma=chroma_count,
+            coeff_window_cb=window_cb,
+            coeff_window_cr=window_cr,
+            coeff_count_cb=cb_count,
+            coeff_count_cr=cr_count,
         )
+        self.coeff_count_luma = luma_count
+        self.coeff_count_cb = cb_count
+        self.coeff_count_cr = cr_count
+        self.coeff_count_chroma = chroma_count
+        self.coeff_window_luma = window_luma
+        self.coeff_window_cb = window_cb
+        self.coeff_window_cr = window_cr
+        self.coeff_window_chroma = window_chroma
+        self.coeff_window = self.coeff_window_luma
 
         if compressed_pretrained:
             state = torch.load(compressed_pretrained, map_location="cpu")
@@ -450,8 +694,23 @@ def build_compressed_backbone(
     range_mode: str,
     mean: Sequence[float],
     std: Sequence[float],
-    coeff_window: int,
+    coeff_window_luma: int | None,
+    coeff_window_chroma: int | None,
+    coeff_count_luma: int,
+    coeff_count_chroma: int,
+    coeff_window_cb: int | None = None,
+    coeff_window_cr: int | None = None,
+    coeff_count_cb: int | None = None,
+    coeff_count_cr: int | None = None,
 ) -> nn.Module:
+    if coeff_window_cb is None:
+        coeff_window_cb = coeff_window_chroma
+    if coeff_window_cr is None:
+        coeff_window_cr = coeff_window_chroma
+    if coeff_count_cb is None:
+        coeff_count_cb = coeff_count_chroma
+    if coeff_count_cr is None:
+        coeff_count_cr = coeff_count_chroma
     if variant == "reconstruction":
         return CompressedResNetReconstruction(
             backbone,
@@ -460,9 +719,39 @@ def build_compressed_backbone(
             std=std,
         )
     if variant == "block-stem":
-        return CompressedResNetBlockStem(backbone, coeff_window=coeff_window)
+        return CompressedResNetBlockStem(
+            backbone,
+            coeff_window_luma=coeff_window_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
     if variant == "luma-fusion":
-        return CompressedResNetLumaFusion(backbone, coeff_window=coeff_window)
+        return CompressedResNetLumaFusion(
+            backbone,
+            coeff_window_luma=coeff_window_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
     if variant == "luma-fusion-pruned":
-        return CompressedResNetLumaFusionPruned(backbone, coeff_window=coeff_window)
+        return CompressedResNetLumaFusionPruned(
+            backbone,
+            coeff_window_luma=coeff_window_luma,
+            coeff_window_chroma=coeff_window_chroma,
+            coeff_count_luma=coeff_count_luma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_window_cb=coeff_window_cb,
+            coeff_window_cr=coeff_window_cr,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
+        )
     raise ValueError(f"Unsupported compressed backbone variant: {variant}")

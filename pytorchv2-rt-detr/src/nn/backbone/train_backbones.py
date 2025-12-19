@@ -53,6 +53,7 @@ except ImportError:  # pragma: no cover - optional dependency
 from ...data.dataset.imagenet import ImageNetDataset
 from ...data.dataset.subset import limit_per_class, limit_total
 from ...data.transforms.compress_reference_images import CompressToDCT, TrimDCTCoefficients
+from ...misc.dct_coefficients import resolve_coefficient_counts
 from ..arch.classification import Classification, ClassHead
 from .presnet import PResNet
 from .compressed_presnet import build_compressed_backbone
@@ -236,16 +237,45 @@ def build_resnet_transforms(
     else:
         train_ops.append(T.ToDtype(torch.float32, scale=True))
         trim_coeffs = bool(trim_coefficients)
-        coeff_window = int(compression.get("coeff_window", 8))
+        _, coeff_count_luma, coeff_count_cb, coeff_count_cr = resolve_coefficient_counts(
+            coeff_window=compression.get("coeff_window"),
+            coeff_count=compression.get("coeff_count"),
+            coeff_window_luma=compression.get("coeff_window_luma"),
+            coeff_count_luma=compression.get("coeff_count_luma"),
+            coeff_window_chroma=compression.get("coeff_window_chroma"),
+            coeff_count_chroma=compression.get("coeff_count_chroma"),
+            coeff_window_cb=compression.get("coeff_window_cb"),
+            coeff_count_cb=compression.get("coeff_count_cb"),
+            coeff_window_cr=compression.get("coeff_window_cr"),
+            coeff_count_cr=compression.get("coeff_count_cr"),
+        )
+        coeff_count_luma = int(coeff_count_luma)
+        coeff_count_cb = int(coeff_count_cb)
+        coeff_count_cr = int(coeff_count_cr)
+        coeff_count_chroma = coeff_count_cb if coeff_count_cb == coeff_count_cr else max(coeff_count_cb, coeff_count_cr)
         train_ops.append(CompressToDCT(**compression))
-        if trim_coeffs and coeff_window < 8:
-            train_ops.append(TrimDCTCoefficients(coeff_window))
+        if trim_coeffs and (coeff_count_luma < 64 or coeff_count_chroma < 64):
+            train_ops.append(
+                TrimDCTCoefficients(
+                    coeff_count_luma,
+                    coeff_count_chroma,
+                    coeff_count_cb=coeff_count_cb,
+                    coeff_count_cr=coeff_count_cr,
+                )
+            )
         if dct_normalizer_train is not None:
             train_ops.append(dct_normalizer_train)
         val_ops.append(T.ToDtype(torch.float32, scale=True))
         val_ops.append(CompressToDCT(**compression))
-        if trim_coeffs and coeff_window < 8:
-            val_ops.append(TrimDCTCoefficients(coeff_window))
+        if trim_coeffs and (coeff_count_luma < 64 or coeff_count_chroma < 64):
+            val_ops.append(
+                TrimDCTCoefficients(
+                    coeff_count_luma,
+                    coeff_count_chroma,
+                    coeff_count_cb=coeff_count_cb,
+                    coeff_count_cr=coeff_count_cr,
+                )
+            )
         if dct_normalizer_val is not None:
             val_ops.append(dct_normalizer_val)
 
@@ -791,11 +821,24 @@ def main() -> None:
     if cfg.input_format == "compressed":
         if cfg.name != "resnet34":
             raise NotImplementedError("Compressed input path currently supports only ResNet34.")
+        _, coeff_count_luma, coeff_count_cb, coeff_count_cr = resolve_coefficient_counts(
+            coeff_window=args.compression_coeff_window,
+        )
+        coeff_count_chroma = coeff_count_cb if coeff_count_cb == coeff_count_cr else max(coeff_count_cb, coeff_count_cr)
         compression_cfg = {
             "coeff_window": args.compression_coeff_window,
+            "coeff_window_luma": args.compression_coeff_window,
+            "coeff_window_chroma": args.compression_coeff_window,
+            "coeff_window_cb": args.compression_coeff_window,
+            "coeff_window_cr": args.compression_coeff_window,
             "range_mode": args.compression_range_mode,
             "dtype": torch.float32,
             "keep_original": args.compression_keep_original,
+            "coeff_count": coeff_count_luma,
+            "coeff_count_luma": coeff_count_luma,
+            "coeff_count_chroma": coeff_count_chroma,
+            "coeff_count_cb": coeff_count_cb,
+            "coeff_count_cr": coeff_count_cr,
         }
         model.backbone = build_compressed_backbone(
             args.compressed_backbone,
@@ -803,7 +846,14 @@ def main() -> None:
             range_mode=args.compression_range_mode,
             mean=_IMAGENET_MEAN,
             std=_IMAGENET_STD,
-            coeff_window=args.compression_coeff_window,
+            coeff_window_luma=args.compression_coeff_window,
+            coeff_window_chroma=args.compression_coeff_window,
+            coeff_window_cb=args.compression_coeff_window,
+            coeff_window_cr=args.compression_coeff_window,
+            coeff_count_luma=coeff_count_luma,
+            coeff_count_chroma=coeff_count_chroma,
+            coeff_count_cb=coeff_count_cb,
+            coeff_count_cr=coeff_count_cr,
         )
         if args.compressed_backbone == "luma-fusion-pruned":
             hidden_dim = model.backbone.out_channels[0]
@@ -843,6 +893,12 @@ def main() -> None:
     print(f"  input format: {cfg.input_format}")
     if cfg.input_format == "compressed":
         print(f"    coeff window: {args.compression_coeff_window}")
+        print(
+            "    coeff counts: "
+            f"Y={compression_cfg['coeff_count_luma']}, "
+            f"Cb={compression_cfg['coeff_count_cb']}, "
+            f"Cr={compression_cfg['coeff_count_cr']}"
+        )
         print(f"    range mode: {args.compression_range_mode}")
         print(f"    keep original: {args.compression_keep_original}")
         print(f"    backbone variant: {args.compressed_backbone}")

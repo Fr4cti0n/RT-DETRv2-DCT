@@ -32,6 +32,7 @@ from src.nn.backbone.train_backbones import (
 )
 from src.data.transforms.dct_normalize import NormalizeDCTCoefficients
 from src.nn.arch.classification import ClassHead
+from src.misc.dct_coefficients import resolve_coefficient_counts
 
 _NUM_CLASSES = 1000
 
@@ -229,13 +230,22 @@ def _load_model(
     range_mode: str,
 ) -> nn.Module:
     model, _ = build_model("resnet34", _NUM_CLASSES)
+    _, coeff_count_luma, coeff_count_cb, coeff_count_cr = resolve_coefficient_counts(
+        coeff_window=coeff_window,
+    )
+    coeff_count_chroma = coeff_count_cb if coeff_count_cb == coeff_count_cr else max(coeff_count_cb, coeff_count_cr)
     model.backbone = build_compressed_backbone(
         variant,
         model.backbone,
         range_mode=range_mode,
         mean=_IMAGENET_MEAN,
         std=_IMAGENET_STD,
-        coeff_window=coeff_window,
+        coeff_window_luma=coeff_window,
+        coeff_window_chroma=coeff_window,
+        coeff_count_luma=coeff_count_luma,
+        coeff_count_chroma=coeff_count_chroma,
+        coeff_count_cb=coeff_count_cb,
+        coeff_count_cr=coeff_count_cr,
     )
     if variant == "luma-fusion-pruned":
         hidden_dim = model.backbone.out_channels[0]
@@ -346,8 +356,21 @@ def main() -> None:
             print(f"[warn] {exc}; skipping directory {directory}.")
             continue
         trim_coefficients = coeff_window < 8 and variant != "reconstruction"
+        _, coeff_count_luma, coeff_count_cb, coeff_count_cr = resolve_coefficient_counts(
+            coeff_window=coeff_window,
+        )
+        coeff_count_chroma = coeff_count_cb if coeff_count_cb == coeff_count_cr else max(coeff_count_cb, coeff_count_cr)
         compression_cfg = {
             "coeff_window": coeff_window,
+            "coeff_window_luma": coeff_window,
+            "coeff_window_chroma": coeff_window,
+            "coeff_window_cb": coeff_window,
+            "coeff_window_cr": coeff_window,
+            "coeff_count": coeff_count_luma,
+            "coeff_count_luma": coeff_count_luma,
+            "coeff_count_chroma": coeff_count_chroma,
+            "coeff_count_cb": coeff_count_cb,
+            "coeff_count_cr": coeff_count_cr,
             "range_mode": args.range_mode,
             "dtype": torch.float32,
             "keep_original": False,
@@ -378,7 +401,8 @@ def main() -> None:
         benchmark = run_trimmed_inference_benchmark(
             model,
             device=device,
-            coeff_window=coeff_window,
+            coeff_window_luma=coeff_window,
+            coeff_window_chroma=coeff_window,
             image_size=args.image_size,
             batch_size=args.benchmark_batch_size,
             val_dirs=[str(args.val_dir)],

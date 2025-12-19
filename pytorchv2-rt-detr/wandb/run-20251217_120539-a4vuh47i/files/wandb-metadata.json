@@ -1,0 +1,67 @@
+{
+  "os": "Linux-6.8.0-87-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.13.5",
+  "startedAt": "2025-12-17T11:05:39.418980Z",
+  "args": [
+    "--train-dirs",
+    "dataset/classification/imagenet1k0",
+    "dataset/classification/imagenet1k1",
+    "dataset/classification/imagenet1k2",
+    "dataset/classification/imagenet1k3",
+    "--val-dir",
+    "dataset/classification/imagenet1kvalid",
+    "--variant",
+    "luma-fusion",
+    "--coeff-window",
+    "4",
+    "--range-mode",
+    "studio",
+    "--epochs",
+    "100",
+    "--batch-size",
+    "256",
+    "--max-train-images",
+    "50000",
+    "--max-val-images",
+    "5000",
+    "--save-best",
+    "--save-last",
+    "--wandb",
+    "--time-limit-hours",
+    "0.1",
+    "--auto-resume"
+  ],
+  "program": "-m src.nn.backbone.train_compressed_backbones",
+  "git": {
+    "remote": "git@github.com:Fr4cti0n/RT-DETRv2-DCT.git",
+    "commit": "381e77c4ad1353b449c7965df76352f7ddc8fa9c"
+  },
+  "email": "firegunneur@outlook.fr",
+  "root": "/home/aduche/Bureau/motion_sight_back_up/R-Yolov1/yolo-v3/Machine-Learning-Collection/ML/Pytorch/object_detection/RT-DETRv2-DCT/pytorchv2-rt-detr",
+  "host": "PO-GSSZR34",
+  "executable": "/home/aduche/Bureau/motion_sight_back_up/R-Yolov1/yolo-v3/Machine-Learning-Collection/ML/Pytorch/object_detection/RT-DETRv2-DCT/pytorchv2-rt-detr/detr-compressed/bin/python",
+  "cpu_count": 20,
+  "cpu_count_logical": 28,
+  "gpu": "NVIDIA RTX 5000 Ada Generation Laptop GPU",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "2001449418752",
+      "used": "1736585859072"
+    }
+  },
+  "memory": {
+    "total": "67091255296"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA RTX 5000 Ada Generation Laptop GPU",
+      "memoryTotal": "17171480576",
+      "cudaCores": 9728,
+      "architecture": "Ada",
+      "uuid": "GPU-42c26b1f-c43d-d031-348c-5cdb63e3a0c9"
+    }
+  ],
+  "cudaVersion": "13.0",
+  "writerId": "kkuh0juue1w1cctfd0tpeyrt1fqzxlu8"
+}
