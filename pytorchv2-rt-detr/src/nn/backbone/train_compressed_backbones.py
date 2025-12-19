@@ -91,6 +91,149 @@ def _parse_coeff_count(value: str) -> int:
     return parsed
 
 
+def _resolve_coefficient_args(args: argparse.Namespace) -> None:
+    coeff_cfg = resolve_coefficient_config(
+        coeff_window=args.coeff_window,
+        coeff_count=args.coeff_count,
+        coeff_window_luma=args.coeff_window_luma,
+        coeff_count_luma=args.coeff_count_luma,
+        coeff_window_chroma=args.coeff_window_chroma,
+        coeff_count_chroma=args.coeff_count_chroma,
+        coeff_window_cb=args.coeff_window_cb,
+        coeff_window_cr=args.coeff_window_cr,
+        coeff_count_cb=args.coeff_count_cb,
+        coeff_count_cr=args.coeff_count_cr,
+    )
+    args.coeff_count = coeff_cfg["coeff_count"]
+    args.coeff_count_luma = coeff_cfg["coeff_count_luma"]
+    args.coeff_count_chroma = coeff_cfg["coeff_count_chroma"]
+    args.coeff_count_cb = coeff_cfg["coeff_count_cb"]
+    args.coeff_count_cr = coeff_cfg["coeff_count_cr"]
+    args.coeff_window = coeff_cfg["coeff_window"]
+    args.coeff_window_luma = coeff_cfg["coeff_window_luma"]
+    args.coeff_window_chroma = coeff_cfg["coeff_window_chroma"]
+    args.coeff_window_cb = coeff_cfg["coeff_window_cb"]
+    args.coeff_window_cr = coeff_cfg["coeff_window_cr"]
+
+
+def _load_checkpoint_compression_config(checkpoint_path: Path) -> dict[str, object]:
+    keys_to_extract = {
+        "coeff_count",
+        "coeff_count_luma",
+        "coeff_count_chroma",
+        "coeff_count_cb",
+        "coeff_count_cr",
+        "coeff_window",
+        "coeff_window_luma",
+        "coeff_window_chroma",
+        "coeff_window_cb",
+        "coeff_window_cr",
+        "trim_coefficients",
+    }
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    except Exception as exc:  # pragma: no cover - best effort metadata load
+        print(f"[resume] Warning: failed to inspect checkpoint at {checkpoint_path}: {exc}")
+        return {}
+    return {key: checkpoint[key] for key in keys_to_extract if key in checkpoint}
+
+
+def _apply_checkpoint_compression_config(args: argparse.Namespace, config: dict[str, object]) -> None:
+    def _assign_optional_int(attr: str) -> None:
+        if attr not in config:
+            return
+        value = config[attr]
+        if value is None:
+            return
+        try:
+            stored = int(value)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return
+        current = getattr(args, attr, None)
+        if current is None:
+            setattr(args, attr, stored)
+        elif current != stored:
+            print(
+                f"[resume] Warning: CLI {attr}={current} differs from checkpoint value {stored}; "
+                "proceeding with CLI value."
+            )
+
+    def _assign_optional_window(attr: str) -> None:
+        if attr not in config:
+            return
+        value = config[attr]
+        if value is None:
+            return
+        try:
+            stored = int(value)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return
+        current = getattr(args, attr, None)
+        if current is None:
+            setattr(args, attr, stored)
+        elif current != stored:
+            print(
+                f"[resume] Warning: CLI {attr}={current} differs from checkpoint value {stored}; "
+                "proceeding with CLI value."
+            )
+
+    def _assign_bool(attr: str) -> None:
+        if attr not in config:
+            return
+        value = config[attr]
+        if value is None:
+            return
+        stored = bool(value)
+        current = getattr(args, attr, None)
+        if current != stored:
+            print(
+                f"[resume] Info: aligning {attr} from {current} to checkpoint value {stored} for resume compatibility."
+            )
+            setattr(args, attr, stored)
+
+    for attr in (
+        "coeff_count",
+        "coeff_count_luma",
+        "coeff_count_chroma",
+        "coeff_count_cb",
+        "coeff_count_cr",
+    ):
+        _assign_optional_int(attr)
+    for attr in (
+        "coeff_window",
+        "coeff_window_luma",
+        "coeff_window_chroma",
+        "coeff_window_cb",
+        "coeff_window_cr",
+    ):
+        _assign_optional_window(attr)
+    _assign_bool("trim_coefficients")
+
+
+def _find_latest_checkpoint(base_dir: Path, variant: str) -> Path | None:
+    if not base_dir.exists():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    prefix = f"{variant}_"
+    for item in base_dir.iterdir():
+        if not item.is_dir():
+            continue
+        if not item.name.startswith(prefix):
+            continue
+        checkpoint_path = item / "checkpoint_last.pth"
+        if not checkpoint_path.exists():
+            continue
+        try:
+            mtime = checkpoint_path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, checkpoint_path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda entry: entry[0], reverse=True)
+    return candidates[0][1]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-dirs", nargs="+", required=True,
@@ -198,6 +341,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-only", action="store_true",
                         help="Skip training and only run validation/benchmarking (requires --resume for pretrained weights).")
     args = parser.parse_args()
+    if args.resume is not None:
+        resume_config_path = args.resume.expanduser()
+        if resume_config_path.is_dir():
+            resume_config_path = resume_config_path / "checkpoint_last.pth"
+        if resume_config_path.exists():
+            resume_config = _load_checkpoint_compression_config(resume_config_path)
+            if resume_config:
+                _apply_checkpoint_compression_config(args, resume_config)
+                if args.variant == "reconstruction" and args.trim_coefficients:
+                    print(
+                        "[resume] Reconstruction variant requires full coefficient depth; overriding stored trim setting."
+                    )
+                    args.trim_coefficients = False
     if getattr(args, "benchmark_disable", False):
         print("[cli] --benchmark-disable is deprecated; use --no-benchmark instead.")
         args.benchmark_enabled = False
@@ -210,28 +366,7 @@ def parse_args() -> argparse.Namespace:
     if args.variant == "reconstruction" and args.trim_coefficients:
         print("[cli] Reconstruction variant requires full coefficient depth; disabling coefficient trimming.")
         args.trim_coefficients = False
-    coeff_cfg = resolve_coefficient_config(
-        coeff_window=args.coeff_window,
-        coeff_count=args.coeff_count,
-        coeff_window_luma=args.coeff_window_luma,
-        coeff_count_luma=args.coeff_count_luma,
-        coeff_window_chroma=args.coeff_window_chroma,
-        coeff_count_chroma=args.coeff_count_chroma,
-        coeff_window_cb=args.coeff_window_cb,
-        coeff_window_cr=args.coeff_window_cr,
-        coeff_count_cb=args.coeff_count_cb,
-        coeff_count_cr=args.coeff_count_cr,
-    )
-    args.coeff_count = coeff_cfg["coeff_count"]
-    args.coeff_count_luma = coeff_cfg["coeff_count_luma"]
-    args.coeff_count_chroma = coeff_cfg["coeff_count_chroma"]
-    args.coeff_count_cb = coeff_cfg["coeff_count_cb"]
-    args.coeff_count_cr = coeff_cfg["coeff_count_cr"]
-    args.coeff_window = coeff_cfg["coeff_window"]
-    args.coeff_window_luma = coeff_cfg["coeff_window_luma"]
-    args.coeff_window_chroma = coeff_cfg["coeff_window_chroma"]
-    args.coeff_window_cb = coeff_cfg["coeff_window_cb"]
-    args.coeff_window_cr = coeff_cfg["coeff_window_cr"]
+    _resolve_coefficient_args(args)
     return args
 
 
@@ -511,6 +646,42 @@ def main() -> None:
     random.seed(args.seed)
     wandb_run = None
 
+    base_output_dir = args.output_dir
+    base_checkpoint_dir = args.checkpoint_dir or base_output_dir
+
+    resume_path: Path | None = None
+    resume_run_dir: Path | None = None
+    auto_resume_source_checkpoint: Path | None = None
+    using_existing_run_dir = False
+
+    if args.resume is not None:
+        resume_path = args.resume.expanduser()
+        if resume_path.is_dir():
+            resume_run_dir = resume_path
+            resume_path = resume_path / "checkpoint_last.pth"
+        else:
+            resume_run_dir = resume_path.parent
+        using_existing_run_dir = True
+    elif args.auto_resume:
+        candidate = _find_latest_checkpoint(base_checkpoint_dir, args.variant)
+        if candidate is not None:
+            resume_path = candidate
+            resume_run_dir = candidate.parent
+            auto_resume_source_checkpoint = candidate
+            using_existing_run_dir = True
+            print(f"[auto-resume] Found checkpoint {candidate}")
+
+    if resume_path is not None and resume_path.exists():
+        resume_config = _load_checkpoint_compression_config(resume_path)
+        if resume_config:
+            _apply_checkpoint_compression_config(args, resume_config)
+            if args.variant == "reconstruction" and args.trim_coefficients:
+                print(
+                    "[resume] Reconstruction variant requires full coefficient depth; overriding stored trim setting."
+                )
+                args.trim_coefficients = False
+            _resolve_coefficient_args(args)
+
     if args.device is not None:
         device = torch.device(args.device)
     else:
@@ -652,10 +823,13 @@ def main() -> None:
     else:
         window_tag += f"_Cb{args.coeff_count_cb}_Cr{args.coeff_count_cr}"
     proposed_run_subdir = f"{args.variant}_{window_tag}_{timestamp_tag}"
+    run_base_subdir = proposed_run_subdir
     run_subdir_name = proposed_run_subdir
-    if args.resume is not None:
-        resume_hint = args.resume.expanduser()
-        run_subdir_name = resume_hint.name if resume_hint.is_dir() else resume_hint.parent.name
+    if resume_run_dir is not None:
+        existing_name = resume_run_dir.name
+        prefix, sep, _ = existing_name.rpartition("_epoch")
+        run_base_subdir = prefix if sep else existing_name
+        run_subdir_name = existing_name
 
     wandb_run = None
 
@@ -694,21 +868,9 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
-    base_output_dir = args.output_dir
-    base_checkpoint_dir = args.checkpoint_dir or base_output_dir
-
-    using_existing_run_dir = False
-    auto_resume_source_checkpoint: Path | None = None
-
-    resume_path: Path | None = None
-    if args.resume is not None:
-        resume_path = args.resume.expanduser()
-        if resume_path.is_dir():
-            resume_path = resume_path / "checkpoint_last.pth"
-        resume_dir = resume_path.parent
-        output_dir = resume_dir
-        checkpoint_dir = resume_dir
-        using_existing_run_dir = True
+    if resume_run_dir is not None:
+        output_dir = resume_run_dir
+        checkpoint_dir = resume_run_dir
     else:
         output_dir = base_output_dir / run_subdir_name
         checkpoint_dir = base_checkpoint_dir / run_subdir_name
@@ -716,33 +878,6 @@ def main() -> None:
     best_acc = 0.0
     start_epoch = 1
 
-    if resume_path is None and args.auto_resume:
-        candidate = checkpoint_dir / "checkpoint_last.pth"
-        if candidate.exists():
-            resume_path = candidate
-            auto_resume_source_checkpoint = candidate
-            using_existing_run_dir = True
-        else:
-            prefix = f"{args.variant}_{window_tag}_"
-            existing_dirs: list[Path] = []
-            if base_checkpoint_dir.exists():
-                existing_dirs = sorted(
-                    (
-                        path
-                        for path in base_checkpoint_dir.iterdir()
-                        if path.is_dir() and path.name.startswith(prefix)
-                    ),
-                    key=lambda path: path.name,
-                    reverse=True,
-                )
-            for run_dir in existing_dirs:
-                if run_dir == checkpoint_dir:
-                    continue
-                candidate = run_dir / "checkpoint_last.pth"
-                if candidate.exists():
-                    resume_path = candidate
-                    auto_resume_source_checkpoint = candidate
-                    break
     if resume_path is not None:
         if resume_path.is_dir():
             resume_path = resume_path / "checkpoint_last.pth"
@@ -807,6 +942,13 @@ def main() -> None:
             "coeff_window": args.coeff_window_luma,
             "coeff_window_luma": args.coeff_window_luma,
             "coeff_window_chroma": args.coeff_window_chroma,
+            "coeff_window_cb": args.coeff_window_cb,
+            "coeff_window_cr": args.coeff_window_cr,
+            "coeff_count": args.coeff_count,
+            "coeff_count_luma": args.coeff_count_luma,
+            "coeff_count_chroma": args.coeff_count_chroma,
+            "coeff_count_cb": args.coeff_count_cb,
+            "coeff_count_cr": args.coeff_count_cr,
             "trim_coefficients": args.trim_coefficients,
             "range_mode": args.range_mode,
             "image_size": args.image_size,
@@ -856,6 +998,13 @@ def main() -> None:
             "coeff_window": args.coeff_window_luma,
             "coeff_window_luma": args.coeff_window_luma,
             "coeff_window_chroma": args.coeff_window_chroma,
+            "coeff_window_cb": args.coeff_window_cb,
+            "coeff_window_cr": args.coeff_window_cr,
+            "coeff_count": args.coeff_count,
+            "coeff_count_luma": args.coeff_count_luma,
+            "coeff_count_chroma": args.coeff_count_chroma,
+            "coeff_count_cb": args.coeff_count_cb,
+            "coeff_count_cr": args.coeff_count_cr,
             "range_mode": args.range_mode,
             "trim_coefficients": args.trim_coefficients,
             "image_size": args.image_size,
@@ -1050,6 +1199,14 @@ def main() -> None:
                             "coeff_window": args.coeff_window_luma,
                             "coeff_window_luma": args.coeff_window_luma,
                             "coeff_window_chroma": args.coeff_window_chroma,
+                            "coeff_window_cb": args.coeff_window_cb,
+                            "coeff_window_cr": args.coeff_window_cr,
+                            "coeff_count": args.coeff_count,
+                            "coeff_count_luma": args.coeff_count_luma,
+                            "coeff_count_chroma": args.coeff_count_chroma,
+                            "coeff_count_cb": args.coeff_count_cb,
+                            "coeff_count_cr": args.coeff_count_cr,
+                            "trim_coefficients": args.trim_coefficients,
                             "range_mode": args.range_mode,
                             "best_acc": best_acc,
                         },
@@ -1068,6 +1225,14 @@ def main() -> None:
                         "coeff_window": args.coeff_window_luma,
                         "coeff_window_luma": args.coeff_window_luma,
                         "coeff_window_chroma": args.coeff_window_chroma,
+                        "coeff_window_cb": args.coeff_window_cb,
+                        "coeff_window_cr": args.coeff_window_cr,
+                        "coeff_count": args.coeff_count,
+                        "coeff_count_luma": args.coeff_count_luma,
+                        "coeff_count_chroma": args.coeff_count_chroma,
+                        "coeff_count_cb": args.coeff_count_cb,
+                        "coeff_count_cr": args.coeff_count_cr,
+                        "trim_coefficients": args.trim_coefficients,
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
                     },
@@ -1085,6 +1250,14 @@ def main() -> None:
                         "coeff_window": args.coeff_window_luma,
                         "coeff_window_luma": args.coeff_window_luma,
                         "coeff_window_chroma": args.coeff_window_chroma,
+                        "coeff_window_cb": args.coeff_window_cb,
+                        "coeff_window_cr": args.coeff_window_cr,
+                        "coeff_count": args.coeff_count,
+                        "coeff_count_luma": args.coeff_count_luma,
+                        "coeff_count_chroma": args.coeff_count_chroma,
+                        "coeff_count_cb": args.coeff_count_cb,
+                        "coeff_count_cr": args.coeff_count_cr,
+                        "trim_coefficients": args.trim_coefficients,
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
                     },
@@ -1161,6 +1334,13 @@ def main() -> None:
                     "coeff_window": args.coeff_window_luma,
                     "coeff_window_luma": args.coeff_window_luma,
                     "coeff_window_chroma": args.coeff_window_chroma,
+                    "coeff_window_cb": args.coeff_window_cb,
+                    "coeff_window_cr": args.coeff_window_cr,
+                    "coeff_count": args.coeff_count,
+                    "coeff_count_luma": args.coeff_count_luma,
+                    "coeff_count_chroma": args.coeff_count_chroma,
+                    "coeff_count_cb": args.coeff_count_cb,
+                    "coeff_count_cr": args.coeff_count_cr,
                     "image_size": args.image_size,
                     "batch_size": bench_bs,
                     "samples": result.samples,
@@ -1187,6 +1367,13 @@ def main() -> None:
             "coeff_window",
             "coeff_window_luma",
             "coeff_window_chroma",
+            "coeff_window_cb",
+            "coeff_window_cr",
+            "coeff_count",
+            "coeff_count_luma",
+            "coeff_count_chroma",
+            "coeff_count_cb",
+            "coeff_count_cr",
             "image_size",
             "batch_size",
             "samples",
@@ -1283,38 +1470,37 @@ def main() -> None:
         else:
             print("Evaluation complete.")
     else:
-        if not using_existing_run_dir:
-            epoch_suffix = f"epoch{max(last_epoch_completed, 0):04d}"
-            final_run_subdir = f"{proposed_run_subdir}_{epoch_suffix}"
-            if final_run_subdir != run_subdir_name:
-                final_output_dir = base_output_dir / final_run_subdir
-                final_checkpoint_dir = base_checkpoint_dir / final_run_subdir
-                final_output_dir.parent.mkdir(parents=True, exist_ok=True)
-                final_checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
-                same_storage = checkpoint_dir.resolve() == output_dir.resolve()
-                if same_storage:
-                    if final_output_dir.exists():
-                        print(
-                            f"[setup] Target directory {final_output_dir} already exists; retaining {output_dir}."
-                        )
-                    else:
-                        output_dir.rename(final_output_dir)
-                        output_dir = final_output_dir
-                        checkpoint_dir = final_output_dir
-                        run_subdir_name = final_run_subdir
-                        print(f"[setup] renamed run directory -> {output_dir}")
+        epoch_suffix = f"epoch{max(last_epoch_completed, 0):04d}"
+        final_run_subdir = f"{run_base_subdir}_{epoch_suffix}"
+        if final_run_subdir != run_subdir_name:
+            final_output_dir = base_output_dir / final_run_subdir
+            final_checkpoint_dir = base_checkpoint_dir / final_run_subdir
+            final_output_dir.parent.mkdir(parents=True, exist_ok=True)
+            final_checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
+            same_storage = checkpoint_dir.resolve() == output_dir.resolve()
+            if same_storage:
+                if final_output_dir.exists():
+                    print(
+                        f"[setup] Target directory {final_output_dir} already exists; retaining {output_dir}."
+                    )
                 else:
-                    if final_output_dir.exists() or final_checkpoint_dir.exists():
-                        print(
-                            "[setup] Target directories already exist; retaining original run directories."
-                        )
-                    else:
-                        output_dir.rename(final_output_dir)
-                        checkpoint_dir.rename(final_checkpoint_dir)
-                        output_dir = final_output_dir
-                        checkpoint_dir = final_checkpoint_dir
-                        run_subdir_name = final_run_subdir
-                        print(f"[setup] renamed run directory -> {output_dir}")
+                    output_dir.rename(final_output_dir)
+                    output_dir = final_output_dir
+                    checkpoint_dir = final_output_dir
+                    run_subdir_name = final_run_subdir
+                    print(f"[setup] renamed run directory -> {output_dir}")
+            else:
+                if final_output_dir.exists() or final_checkpoint_dir.exists():
+                    print(
+                        "[setup] Target directories already exist; retaining original run directories."
+                    )
+                else:
+                    output_dir.rename(final_output_dir)
+                    checkpoint_dir.rename(final_checkpoint_dir)
+                    output_dir = final_output_dir
+                    checkpoint_dir = final_checkpoint_dir
+                    run_subdir_name = final_run_subdir
+                    print(f"[setup] renamed run directory -> {output_dir}")
         print(f"Training complete. Best val acc@1={best_acc:.4f}")
         if time_limit_triggered:
             print("Stopped early due to the configured time limit.")
