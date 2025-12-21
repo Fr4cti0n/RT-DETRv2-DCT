@@ -146,6 +146,8 @@ def _cleanup_distributed() -> None:
 
 
 def _is_main_process(args: argparse.Namespace) -> bool:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
     return not getattr(args, "distributed", False) or getattr(args, "rank", 0) == 0
 
 
