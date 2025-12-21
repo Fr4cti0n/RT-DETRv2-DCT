@@ -1143,7 +1143,7 @@ def main() -> None:
     )
     scheduler = MultiStepLR(optimizer, milestones=milestones, gamma=args.lr_gamma)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
     if resume_run_dir is not None:
         output_dir = resume_run_dir
@@ -1184,7 +1184,10 @@ def main() -> None:
             return
 
     if args.distributed:
-        ddp_kwargs: dict[str, object] = {"static_graph": args.ddp_static_graph}
+        ddp_kwargs: dict[str, object] = {
+            "static_graph": args.ddp_static_graph,
+            "find_unused_parameters": not args.ddp_static_graph,
+        }
         if device.type == "cuda":
             ddp_kwargs["device_ids"] = [args.local_rank]
             ddp_kwargs["output_device"] = args.local_rank
