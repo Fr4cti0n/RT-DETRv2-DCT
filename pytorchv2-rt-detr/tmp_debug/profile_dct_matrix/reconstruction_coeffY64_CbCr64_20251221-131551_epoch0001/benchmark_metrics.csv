@@ -1,0 +1,7 @@
+timestamp,variant,coeff_window,coeff_window_luma,coeff_window_chroma,coeff_window_cb,coeff_window_cr,coeff_count,coeff_count_luma,coeff_count_chroma,coeff_count_cb,coeff_count_cr,image_size,batch_size,samples,measured_batches,throughput_img_s,mean_latency_ms,input_mb_per_batch,peak_memory_mb,coeff_channels,coeff_channels_cb,coeff_channels_cr,coeff_channels_chroma,val_loss,val_acc1,val_acc5
+2025-12-21 13:15:57,reconstruction,8,8,8,8,8,64,64,64,64,64,256,1,20,20,479.3713686949934,2.086065345793031,0.375,292.3798828125,64,64,64,64,,,
+2025-12-21 13:15:57,reconstruction,8,8,8,8,8,64,64,64,64,64,256,8,88,11,1700.840649110418,4.703556446739557,3.0,417.30859375,64,64,64,64,,,
+2025-12-21 13:15:57,reconstruction,8,8,8,8,8,64,64,64,64,64,256,32,32,1,1583.3572525648553,20.210221002344042,12.0,847.119140625,64,64,64,64,,,
+2025-12-21 13:15:57,reconstruction,8,8,8,8,8,64,64,64,64,64,256,64,64,1,1251.641141197509,51.132866996340454,24.0,1416.9912109375,64,64,64,64,,,
+2025-12-21 13:15:57,reconstruction,8,8,8,8,8,64,64,64,64,64,256,128,128,1,1278.5139576232827,100.11623200261965,48.0,2562.4970703125,64,64,64,64,,,
+2025-12-21 13:15:57,reconstruction,8,8,8,8,8,64,64,64,64,64,256,256,128,1,1317.630933570735,97.14404598344117,48.0,2562.4970703125,64,64,64,64,,,

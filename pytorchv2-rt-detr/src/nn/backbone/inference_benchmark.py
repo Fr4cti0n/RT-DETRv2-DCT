@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
@@ -147,34 +148,38 @@ def _prune_payload(
     return y_trimmed, (cb_final, cr_final)
 
 
-def _build_trimmed_collate_fn(
-    coeff_count_luma: int,
-    coeff_count_cb: int,
-    coeff_count_cr: int,
-):
-    active_idx_luma = _build_active_index(coeff_count_luma)
-    active_idx_cb = _build_active_index(coeff_count_cb)
-    active_idx_cr = _build_active_index(coeff_count_cr)
-    expected_luma = int(coeff_count_luma)
-    expected_cb = int(coeff_count_cb)
-    expected_cr = int(coeff_count_cr)
+class _TrimmedCollate:
+    def __init__(
+        self,
+        coeff_count_luma: int,
+        coeff_count_cb: int,
+        coeff_count_cr: int,
+    ) -> None:
+        # Cache active coefficient indices once so each worker reuses them.
+        self._active_idx_luma = _build_active_index(coeff_count_luma)
+        self._active_idx_cb = _build_active_index(coeff_count_cb)
+        self._active_idx_cr = _build_active_index(coeff_count_cr)
+        self._expected_luma = int(coeff_count_luma)
+        self._expected_cb = int(coeff_count_cb)
+        self._expected_cr = int(coeff_count_cr)
 
-    def collate(
-        batch: Iterable[tuple[tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]], int]]
-    ):
-        y_list = []
-        cb_list = []
-        cr_list = []
-        targets = []
+    def __call__(
+        self,
+        batch: Iterable[tuple[tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]], int]],
+    ) -> tuple[tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        y_list: list[torch.Tensor] = []
+        cb_list: list[torch.Tensor] = []
+        cr_list: list[torch.Tensor] = []
+        targets: list[int] = []
         for payload, target in batch:
             y_trimmed, (cb_trimmed, cr_trimmed) = _prune_payload(
                 payload,
-                active_idx_luma,
-                expected_luma,
-                active_idx_cb,
-                expected_cb,
-                active_idx_cr,
-                expected_cr,
+                self._active_idx_luma,
+                self._expected_luma,
+                self._active_idx_cb,
+                self._expected_cb,
+                self._active_idx_cr,
+                self._expected_cr,
             )
             y_list.append(y_trimmed)
             cb_list.append(cb_trimmed)
@@ -186,7 +191,13 @@ def _build_trimmed_collate_fn(
         target_batch = torch.tensor(targets, dtype=torch.long)
         return (y_batch, (cb_batch, cr_batch)), target_batch
 
-    return collate
+
+def _build_trimmed_collate_fn(
+    coeff_count_luma: int,
+    coeff_count_cb: int,
+    coeff_count_cr: int,
+) -> _TrimmedCollate:
+    return _TrimmedCollate(coeff_count_luma, coeff_count_cb, coeff_count_cr)
 
 
 def build_trimmed_eval_loader(
@@ -221,6 +232,18 @@ def build_trimmed_eval_loader(
     if max_samples is not None and max_samples > 0:
         dataset = limit_total(dataset, max_samples)
     collate = _build_trimmed_collate_fn(coeff_count_luma, coeff_count_cb, coeff_count_cr)
+    dct_device_spec = compression.get("dct_device")
+    dct_device_name = None
+    if isinstance(dct_device_spec, torch.device):
+        dct_device_name = dct_device_spec.type
+    elif isinstance(dct_device_spec, str):
+        dct_device_name = dct_device_spec.lower()
+    needs_spawn = False
+    if dct_device_name == "auto":
+        needs_spawn = torch.cuda.is_available()
+    elif isinstance(dct_device_name, str) and dct_device_name.startswith("cuda"):
+        needs_spawn = True
+    mp_context = mp.get_context("spawn") if needs_spawn and workers > 0 else None
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -229,6 +252,7 @@ def build_trimmed_eval_loader(
         pin_memory=True,
         drop_last=False,
         collate_fn=collate,
+        multiprocessing_context=mp_context,
     )
     return loader
 

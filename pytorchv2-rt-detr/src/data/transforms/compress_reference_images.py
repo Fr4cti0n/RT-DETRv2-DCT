@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Union
 
@@ -94,8 +95,20 @@ def _map_range(plane: np.ndarray, mode: str, chroma: bool = False) -> np.ndarray
     raise ValueError(f"Unsupported range mode: {mode}")
 
 
-def _plane_to_blocks(dct_plane: np.ndarray) -> np.ndarray:
+def _plane_to_blocks(dct_plane: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     """Reshape a 2D DCT plane into (nb_y, nb_x, 64) blocks using column-major order."""
+
+    if torch.is_tensor(dct_plane):
+        height, width = dct_plane.shape
+        blocks_y = height // 8
+        blocks_x = width // 8
+        return (
+            dct_plane.view(blocks_y, 8, blocks_x, 8)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(blocks_y, blocks_x, 64)
+        )
+
     height, width = dct_plane.shape
     blocks_y = height // 8
     blocks_x = width // 8
@@ -117,22 +130,39 @@ def _build_active_index(coeff_count: int) -> np.ndarray | None:
     return np.array(indices, dtype=np.int64)
 
 
-def _apply_frequency_selection(blocks: np.ndarray, coeff_count: int) -> np.ndarray:
+def _apply_frequency_selection(blocks: np.ndarray | torch.Tensor, coeff_count: int):
     """Zero out high-frequency coefficients outside the selected subset per block."""
     count = validate_coeff_count(coeff_count, name="coeff_count")
     if count >= 64:
         return blocks
-    mask_vec = np.array(build_active_mask(count), dtype=np.float32)
+    mask_vec = build_active_mask(count)
+    if torch.is_tensor(blocks):
+        mask_tensor = torch.as_tensor(mask_vec, dtype=blocks.dtype, device=blocks.device)
+        original_shape = blocks.shape
+        reshaped = blocks.view(-1, 64)
+        reshaped = reshaped * mask_tensor
+        return reshaped.view(*original_shape)
+    mask_array = np.array(mask_vec, dtype=np.float32)
     reshaped = blocks.reshape((-1, 64), order="F")
-    reshaped *= mask_vec
+    reshaped *= mask_array
     return reshaped.reshape(blocks.shape, order="F")
 
 
-def _forward_dct(plane: np.ndarray) -> np.ndarray:
+def _forward_dct(
+    plane: np.ndarray,
+    *,
+    device: Optional[torch.device] = None,
+    return_tensor: bool = False,
+) -> np.ndarray | torch.Tensor:
     """Run the forward block-wise DCT using the existing project helper."""
-    dct_plane = FrameDCT._forward_dct_plane(plane)
+
+    dct_plane = FrameDCT._forward_dct_plane(plane, device=device, return_tensor=return_tensor)
     if dct_plane is None:
         raise RuntimeError("Forward DCT returned None despite valid input plane.")
+    if return_tensor:
+        if not torch.is_tensor(dct_plane):
+            dct_plane = torch.from_numpy(dct_plane)
+        return dct_plane.to(dtype=torch.float32)
     return dct_plane.astype(np.float32)
 
 
@@ -143,7 +173,14 @@ def _compress_image_array(
     coeff_count_cb: int,
     coeff_count_cr: int,
     round_blocks: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    *,
+    dct_device: Optional[torch.device] = None,
+) -> Tuple[
+    np.ndarray | torch.Tensor,
+    np.ndarray | torch.Tensor,
+    np.ndarray | torch.Tensor,
+    dict[str, np.ndarray],
+]:
     """Core helper that converts a BGR image into DCT coefficient blocks."""
 
     image = _ensure_macroblock_multiple(image_bgr)
@@ -152,9 +189,11 @@ def _compress_image_array(
     cb_plane = _map_range(cb_plane, range_mode, chroma=True)
     cr_plane = _map_range(cr_plane, range_mode, chroma=True)
 
-    y_dct = _forward_dct(y_plane)
-    cb_dct = _forward_dct(cb_plane)
-    cr_dct = _forward_dct(cr_plane)
+    use_tensors = dct_device is not None and dct_device.type == "cuda"
+
+    y_dct = _forward_dct(y_plane, device=dct_device, return_tensor=use_tensors)
+    cb_dct = _forward_dct(cb_plane, device=dct_device, return_tensor=use_tensors)
+    cr_dct = _forward_dct(cr_plane, device=dct_device, return_tensor=use_tensors)
 
     luma_blocks = _plane_to_blocks(y_dct)
     cb_blocks = _plane_to_blocks(cb_dct)
@@ -164,14 +203,24 @@ def _compress_image_array(
     cb_blocks = _apply_frequency_selection(cb_blocks, coeff_count_cb)
     cr_blocks = _apply_frequency_selection(cr_blocks, coeff_count_cr)
 
-    if round_blocks:
-        luma_blocks = np.rint(luma_blocks).astype(np.int16, copy=False)
-        cb_blocks = np.rint(cb_blocks).astype(np.int16, copy=False)
-        cr_blocks = np.rint(cr_blocks).astype(np.int16, copy=False)
+    if torch.is_tensor(luma_blocks):
+        if round_blocks:
+            luma_blocks = torch.round(luma_blocks).to(torch.int16)
+            cb_blocks = torch.round(cb_blocks).to(torch.int16)
+            cr_blocks = torch.round(cr_blocks).to(torch.int16)
+        else:
+            luma_blocks = luma_blocks.to(torch.float32)
+            cb_blocks = cb_blocks.to(torch.float32)
+            cr_blocks = cr_blocks.to(torch.float32)
     else:
-        luma_blocks = luma_blocks.astype(np.float32, copy=False)
-        cb_blocks = cb_blocks.astype(np.float32, copy=False)
-        cr_blocks = cr_blocks.astype(np.float32, copy=False)
+        if round_blocks:
+            luma_blocks = np.rint(luma_blocks).astype(np.int16, copy=False)
+            cb_blocks = np.rint(cb_blocks).astype(np.int16, copy=False)
+            cr_blocks = np.rint(cr_blocks).astype(np.int16, copy=False)
+        else:
+            luma_blocks = luma_blocks.astype(np.float32, copy=False)
+            cb_blocks = cb_blocks.astype(np.float32, copy=False)
+            cr_blocks = cr_blocks.astype(np.float32, copy=False)
 
     luma_grid_shape = np.array(luma_blocks.shape[:2], dtype=np.int32)
     chroma_grid_shape = np.array(cb_blocks.shape[:2], dtype=np.int32)
@@ -269,6 +318,39 @@ def _resolve_torch_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
     raise ValueError(f"Unsupported dtype specification: {dtype!r}")
 
 
+def _resolve_dct_device(device: Union[str, torch.device, None]) -> Optional[torch.device]:
+    if device is None:
+        return None
+    if isinstance(device, torch.device):
+        resolved = device
+    elif isinstance(device, str):
+        spec = device.strip()
+        if not spec or spec.lower() in {"cpu", "none"}:
+            return None
+        if spec.lower() == "auto":
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            warnings.warn(
+                "Requested 'auto' DCT device but CUDA is not available; falling back to CPU.",
+                RuntimeWarning,
+            )
+            return None
+        try:
+            resolved = torch.device(spec)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError(f"Unsupported DCT device specification: {device!r}") from exc
+    else:
+        raise ValueError(f"Unsupported DCT device specification: {device!r}")
+
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        warnings.warn(
+            f"Requested CUDA DCT device {resolved} but CUDA is not available; falling back to CPU.",
+            RuntimeWarning,
+        )
+        return None
+    return resolved
+
+
 @register()
 class CompressToDCT(T.Transform):
     """Transform that converts an RGB tensor into DCT coefficient blocks.
@@ -285,6 +367,7 @@ class CompressToDCT(T.Transform):
         range_mode: str = "studio",
         dtype: Union[str, torch.dtype] = torch.float32,
         keep_original: bool = False,
+        dct_device: Union[str, torch.device, None] = None,
         *,
         coeff_window_luma: int | None = None,
         coeff_window_chroma: int | None = None,
@@ -332,6 +415,7 @@ class CompressToDCT(T.Transform):
         self.dtype = _resolve_torch_dtype(dtype)
         self.keep_original = keep_original
         self.selection_order = selection_order
+        self.dct_device = _resolve_dct_device(dct_device)
 
     @staticmethod
     def _to_bgr_array(image: TensorLike) -> np.ndarray:
@@ -386,7 +470,9 @@ class CompressToDCT(T.Transform):
         return array[..., ::-1]
 
     @staticmethod
-    def _blocks_to_tensor(blocks: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
+    def _blocks_to_tensor(blocks: np.ndarray | torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(blocks):
+            return blocks.permute(2, 0, 1).contiguous().to(dtype=dtype)
         tensor = torch.from_numpy(blocks).permute(2, 0, 1)
         return tensor.to(dtype)
 
@@ -400,6 +486,7 @@ class CompressToDCT(T.Transform):
             self.coeff_count_cb,
             self.coeff_count_cr,
             round_blocks=False,
+            dct_device=self.dct_device,
         )
 
         y_tensor = self._blocks_to_tensor(luma_blocks, self.dtype)

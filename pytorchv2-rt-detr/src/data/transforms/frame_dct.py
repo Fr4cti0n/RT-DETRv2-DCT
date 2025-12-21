@@ -8,11 +8,19 @@ représenter une frame au format DCT (2D) et ses attributs.
 # importation des librairies
 
 
+import math
+
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from scipy.fftpack import idct, dct
 from math import ceil
+
 from .frame import Frame
+
+_DCT_MATRIX_CACHE: dict[tuple[np.dtype, int], tuple[np.ndarray, np.ndarray]] = {}
+_TORCH_DCT_MATRIX_CACHE: dict[tuple[torch.dtype, str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
 
 class FrameDCT(Frame):
 
@@ -380,29 +388,143 @@ Les vecteur_mouvement sont mis sous forme de matrice avant d'être placé dans l
         return plane[:target_h, :target_w]
 
     @staticmethod
-    def _forward_dct_plane(plane: np.ndarray | None) -> np.ndarray | None:
-        """Calcule la DCT bloc par bloc d'un plan spatial."""
+    def _forward_dct_plane(
+        plane: np.ndarray | None,
+        *,
+        device: torch.device | None = None,
+        return_tensor: bool = False,
+    ) -> np.ndarray | torch.Tensor | None:
+        """Calcule la DCT bloc par bloc d'un plan spatial.
+
+        Args:
+            plane: plan spatial à transformer.
+            device: périphérique à utiliser (None => CPU numpy).
+            return_tensor: quand True, renvoie un tenseur torch plutôt qu'un tableau numpy.
+        """
 
         if plane is None:
             return None
-        height, width = plane.shape
+
+        working = plane.astype(np.float32, copy=False)
+        height, width = working.shape
         if height % 8 != 0 or width % 8 != 0:
             pad_h = (8 - height % 8) % 8
             pad_w = (8 - width % 8) % 8
-            plane = np.pad(plane, ((0, pad_h), (0, pad_w)), mode='edge')
-            height, width = plane.shape
+            working = np.pad(working, ((0, pad_h), (0, pad_w)), mode="edge")
+            height, width = working.shape
+
+        if device is not None and device.type != "cpu":
+            return FrameDCT._forward_dct_plane_torch(working, device, return_tensor=return_tensor)
 
         blocks_y = height // 8
         blocks_x = width // 8
 
-        reshaped = plane.reshape(blocks_y, 8, blocks_x, 8).transpose(0, 2, 1, 3)
+        reshaped = working.reshape(blocks_y, 8, blocks_x, 8).transpose(0, 2, 1, 3)
         blocks = reshaped.reshape(-1, 8, 8)
 
-        blocks = dct(blocks, type=2, norm='ortho', axis=1)
-        blocks = dct(blocks, type=2, norm='ortho', axis=2)
+        matrix, matrix_t = FrameDCT._get_dct_matrices(dtype=blocks.dtype, size=8)
+        tmp = np.matmul(blocks, matrix_t)
+        blocks = np.matmul(matrix, tmp)
 
         dct_frame = blocks.reshape(blocks_y, blocks_x, 8, 8).transpose(0, 2, 1, 3)
-        return dct_frame.reshape(height, width)
+        result = dct_frame.reshape(height, width).astype(np.float32, copy=False)
+        if return_tensor:
+            return torch.from_numpy(result)
+        return result
+
+    @staticmethod
+    def _get_dct_matrices(dtype: np.dtype, size: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return cached forward DCT matrices for the requested block size."""
+        cache_key = (np.dtype(dtype), size)
+        cached = _DCT_MATRIX_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        n = size
+        k = np.arange(n, dtype=np.float64).reshape(-1, 1)
+        m = np.arange(n, dtype=np.float64).reshape(1, -1)
+        basis = np.cos((np.pi / n) * (m + 0.5) * k)
+        basis[0, :] *= 1.0 / np.sqrt(n)
+        basis[1:, :] *= np.sqrt(2.0 / n)
+
+        basis = basis.astype(dtype, copy=False)
+        basis_t = basis.T.copy()
+        _DCT_MATRIX_CACHE[cache_key] = (basis, basis_t)
+        return basis, basis_t
+
+    @staticmethod
+    def _get_torch_dct_matrices(
+        dtype: torch.dtype,
+        size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached DCT matrices as torch tensors on the requested device."""
+
+        cache_key = (dtype, str(device), size)
+        cached = _TORCH_DCT_MATRIX_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        n = size
+        k = torch.arange(n, dtype=torch.float64, device=device).reshape(-1, 1)
+        m = torch.arange(n, dtype=torch.float64, device=device).reshape(1, -1)
+        basis = torch.cos((math.pi / n) * (m + 0.5) * k)
+        basis[0, :] *= 1.0 / math.sqrt(n)
+        basis[1:, :] *= math.sqrt(2.0 / n)
+
+        basis = basis.to(dtype)
+        basis_t = basis.t().contiguous()
+        _TORCH_DCT_MATRIX_CACHE[cache_key] = (basis, basis_t)
+        return basis, basis_t
+
+    @staticmethod
+    def _torch_dct_1d(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Compute a DCT-II with orthonormal scaling via rFFT."""
+
+        n = tensor.size(dim)
+        moved = tensor.movedim(dim, -1)
+        v = torch.cat([moved, torch.flip(moved, dims=[-1])], dim=-1)
+        v_freq = torch.fft.rfft(v, dim=-1)
+        k = torch.arange(n, device=moved.device, dtype=moved.dtype)
+        angles = -math.pi * k / (2.0 * n)
+        factor = torch.complex(torch.cos(angles), torch.sin(angles))
+        transformed = (v_freq[..., :n] * factor.to(v_freq.dtype)).real
+        transformed[..., 0] /= math.sqrt(2.0)
+        transformed *= math.sqrt(1.0 / (2.0 * n))
+        return transformed.movedim(-1, dim)
+
+    @staticmethod
+    def _forward_dct_plane_torch(
+        plane: np.ndarray,
+        device: torch.device,
+        *,
+        return_tensor: bool = False,
+    ) -> np.ndarray | torch.Tensor:
+        """Calcule la DCT bloc par bloc sur GPU à l'aide de torch."""
+
+        height, width = plane.shape
+        blocks_y = height // 8
+        blocks_x = width // 8
+
+        tensor = torch.from_numpy(plane).to(device=device, dtype=torch.float32)
+        tensor = tensor.view(blocks_y, 8, blocks_x, 8).permute(0, 2, 1, 3).contiguous()
+
+        if device.type == "cuda":
+            tensor = FrameDCT._torch_dct_1d(tensor, dim=-1)
+            tensor = FrameDCT._torch_dct_1d(tensor, dim=-2)
+            blocks = tensor
+        else:
+            blocks = tensor.view(-1, 8, 8)
+            matrix, matrix_t = FrameDCT._get_torch_dct_matrices(blocks.dtype, 8, device)
+            tmp = torch.matmul(blocks, matrix_t)
+            blocks = torch.matmul(matrix, tmp)
+            blocks = blocks.view(blocks_y, blocks_x, 8, 8)
+
+        dct_frame = blocks.permute(0, 2, 1, 3).contiguous()
+        result = dct_frame.view(height, width)
+        if return_tensor:
+            return result
+        return result.to(device="cpu").numpy().astype(np.float32, copy=False)
 
     @staticmethod
     def build_dct_state(component) -> dict:
