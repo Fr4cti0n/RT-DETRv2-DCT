@@ -270,11 +270,20 @@ def _apply_checkpoint_compression_config(args: argparse.Namespace, config: dict[
     _assign_bool("trim_coefficients")
 
 
-def _find_latest_checkpoint(base_dir: Path, variant: str) -> Path | None:
+def _format_run_prefix(variant: str, coeff_luma: int, coeff_cb: int, coeff_cr: int) -> str:
+    window_tag = f"coeffY{coeff_luma}"
+    if coeff_cb == coeff_cr:
+        window_tag += f"_CbCr{coeff_cb}"
+    else:
+        window_tag += f"_Cb{coeff_cb}_Cr{coeff_cr}"
+    return f"{variant}_{window_tag}"
+
+
+def _find_latest_checkpoint(base_dir: Path, run_prefix: str) -> Path | None:
     if not base_dir.exists():
         return None
     candidates: list[tuple[float, Path]] = []
-    prefix = f"{variant}_"
+    prefix = f"{run_prefix}_"
     for item in base_dir.iterdir():
         if not item.is_dir():
             continue
@@ -900,6 +909,12 @@ def main() -> None:
     resume_run_dir: Path | None = None
     auto_resume_source_checkpoint: Path | None = None
     using_existing_run_dir = False
+    run_prefix = _format_run_prefix(
+        args.variant,
+        args.coeff_count_luma,
+        args.coeff_count_cb,
+        args.coeff_count_cr,
+    )
 
     if args.resume is not None:
         resume_path = args.resume.expanduser()
@@ -910,7 +925,7 @@ def main() -> None:
             resume_run_dir = resume_path.parent
         using_existing_run_dir = True
     elif args.auto_resume:
-        candidate = _find_latest_checkpoint(base_checkpoint_dir, args.variant)
+        candidate = _find_latest_checkpoint(base_checkpoint_dir, run_prefix)
         if candidate is not None:
             resume_path = candidate
             resume_run_dir = candidate.parent
@@ -920,7 +935,8 @@ def main() -> None:
                 print(f"[auto-resume] Found checkpoint {candidate}")
         elif is_main:
             print(
-                f"[auto-resume] No checkpoint found under {base_checkpoint_dir} for variant '{args.variant}'; starting fresh."
+                "[auto-resume] No checkpoint found under "
+                f"{base_checkpoint_dir} matching prefix '{run_prefix}_'; starting fresh."
             )
 
     if resume_path is not None and resume_path.exists():
@@ -934,6 +950,13 @@ def main() -> None:
                     )
                 args.trim_coefficients = False
             _resolve_coefficient_args(args)
+
+    run_prefix = _format_run_prefix(
+        args.variant,
+        args.coeff_count_luma,
+        args.coeff_count_cb,
+        args.coeff_count_cr,
+    )
 
     coeff_descriptor = f"coeffY{args.coeff_count_luma}_Cb{args.coeff_count_cb}_Cr{args.coeff_count_cr}"
 
@@ -1084,12 +1107,7 @@ def main() -> None:
     time_limit_seconds = time_limit_hours * 3600.0 if time_limit_hours is not None else None
 
     timestamp_tag = time.strftime("%Y%m%d-%H%M%S")
-    window_tag = f"coeffY{args.coeff_count_luma}"
-    if args.coeff_count_cb == args.coeff_count_cr:
-        window_tag += f"_CbCr{args.coeff_count_cb}"
-    else:
-        window_tag += f"_Cb{args.coeff_count_cb}_Cr{args.coeff_count_cr}"
-    proposed_run_subdir = f"{args.variant}_{window_tag}_{timestamp_tag}"
+    proposed_run_subdir = f"{run_prefix}_{timestamp_tag}"
     run_base_subdir = proposed_run_subdir
     run_subdir_name = proposed_run_subdir
     if resume_run_dir is not None:
