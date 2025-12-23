@@ -918,6 +918,10 @@ def main() -> None:
             using_existing_run_dir = True
             if is_main:
                 print(f"[auto-resume] Found checkpoint {candidate}")
+        elif is_main:
+            print(
+                f"[auto-resume] No checkpoint found under {base_checkpoint_dir} for variant '{args.variant}'; starting fresh."
+            )
 
     if resume_path is not None and resume_path.exists():
         resume_config = _load_checkpoint_compression_config(resume_path)
@@ -1231,6 +1235,11 @@ def main() -> None:
         if wandb_resume_id is not None:
             wandb_resume_mode = "allow"
             print(f"[wandb] Resuming run id={wandb_resume_id}")
+        elif args.auto_resume and auto_resume_source_checkpoint is not None and is_main:
+            expected_id_path = auto_resume_source_checkpoint.parent / "wandb_run_id.txt"
+            print(
+                f"[auto-resume] Warning: expected W&B run id at {expected_id_path}, but none was found; logging will start a new run."
+            )
 
         wandb_config = {
             "variant": args.variant,
