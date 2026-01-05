@@ -2,6 +2,7 @@
 """
 
 import pickle
+import re
 import sys
 import torch 
 import torch.nn as nn 
@@ -92,7 +93,9 @@ class BaseSolver(object):
 
         # NOTE instantiating order
         if self.cfg.resume:
-            print(f'Resume checkpoint from {self.cfg.resume}')
+            resume_path = Path(self.cfg.resume).expanduser()
+            resume_dir = resume_path.parent if resume_path.is_file() else resume_path
+            print(f'Resume checkpoint from {resume_path} (directory {resume_dir})')
             self.load_resume_state(self.cfg.resume)
 
     def eval(self, ):
@@ -104,7 +107,9 @@ class BaseSolver(object):
         self.evaluator = self.cfg.evaluator
         
         if self.cfg.resume:
-            print(f'Resume checkpoint from {self.cfg.resume}')
+            resume_path = Path(self.cfg.resume).expanduser()
+            resume_dir = resume_path.parent if resume_path.is_file() else resume_path
+            print(f'Resume checkpoint from {resume_path} (directory {resume_dir})')
             self.load_resume_state(self.cfg.resume)
 
         self._maybe_update_wandb_data_info()
@@ -237,9 +242,41 @@ class BaseSolver(object):
             self.wandb_run = None
             return
 
-        run_name = self.cfg.wandb_run_name or self.output_dir.name
+        output_dir = Path(self.output_dir) if self.output_dir else Path.cwd()
+        run_id_path = output_dir / "wandb_run_id.txt"
+
+        wandb_resume_id: str | None = None
+        resume_sources: list[Path] = []
+
+        resume_cfg = getattr(self.cfg, 'resume', None)
+        if resume_cfg:
+            resume_path = Path(resume_cfg).expanduser()
+            resume_dir = resume_path.parent if resume_path.is_file() else resume_path
+            resume_sources.append(resume_dir / "wandb_run_id.txt")
+            if run_id_path not in resume_sources:
+                resume_sources.append(run_id_path)
+
+        for candidate in resume_sources:
+            try:
+                text = candidate.read_text().strip()
+            except OSError:
+                continue
+            if text:
+                wandb_resume_id = text
+                print(f"[wandb] Found existing run id at {candidate}; will resume logging.")
+                break
+
+        run_name = self.cfg.wandb_run_name or output_dir.name
         project = self.cfg.wandb_project or 'rtdetr-detection'
-        wandb_tags = self.cfg.wandb_tags
+
+        raw_tags = self.cfg.wandb_tags
+        tags: list[str] | None = None
+        if raw_tags:
+            tags = []
+            iterable = [raw_tags] if isinstance(raw_tags, str) else list(raw_tags)
+            for tag in iterable:
+                if tag and tag not in tags:
+                    tags.append(tag)
 
         wandb_config = {
             "task": self.cfg.task,
@@ -254,14 +291,28 @@ class BaseSolver(object):
             wandb_config["output_dir"] = str(self.cfg.output_dir)
         if self.cfg.device:
             wandb_config["device"] = self.cfg.device
+        time_limit_seconds = getattr(self.cfg, 'time_limit_seconds', None)
+        if time_limit_seconds:
+            wandb_config["time_limit_seconds"] = int(time_limit_seconds)
+
+        resume_mode = "allow" if wandb_resume_id else None
+        if wandb_resume_id:
+            print(f"[wandb] Resuming run id={wandb_resume_id}")
 
         self.wandb_run = wandb.init(
             project=project,
             entity=self.cfg.wandb_entity or None,
             name=run_name,
-            tags=wandb_tags,
+            tags=tags,
             config=wandb_config,
+            id=wandb_resume_id,
+            resume=resume_mode,
         )
+
+        try:
+            run_id_path.write_text(self.wandb_run.id)
+        except OSError as exc:
+            print(f"[wandb] Warning: failed to persist run id to {run_id_path}: {exc}")
 
     def _finish_wandb(self) -> None:
         if self.wandb_run is not None:
@@ -287,6 +338,41 @@ class BaseSolver(object):
                 pass
         if info:
             self.wandb_run.config.update(info, allow_val_change=True)
+
+    def _finalize_output_dir_with_epoch(self) -> None:
+        if not dist_utils.is_main_process():
+            return
+        if not getattr(self, 'output_dir', None):
+            return
+        current = Path(self.output_dir)
+        if not current.exists():
+            return
+
+        final_epoch = max(0, self.last_epoch + 1)
+        suffix = f"_epoch{final_epoch:04d}"
+        base_name = re.sub(r"_epoch\d{4}$", "", current.name)
+        target = current.parent / f"{base_name}{suffix}"
+
+        if target == current:
+            return
+        if target.exists():
+            print(f"[output-dir] Warning: target directory {target} already exists; skipping rename.")
+            return
+
+        try:
+            current.rename(target)
+        except OSError as exc:
+            print(f"[output-dir] Warning: failed to append epoch suffix to {current}: {exc}")
+            return
+
+        self.output_dir = target
+        self.cfg.output_dir = str(target)
+        self.cfg.yaml_cfg['output_dir'] = self.cfg.output_dir
+        if getattr(self.cfg, 'summary_dir', None):
+            summary_path = target / "summary"
+            self.cfg.summary_dir = str(summary_path)
+            self.cfg.yaml_cfg['summary_dir'] = self.cfg.summary_dir
+        print(f"[output-dir] Finalized run directory -> {target}")
 
 
     def fit(self, ):

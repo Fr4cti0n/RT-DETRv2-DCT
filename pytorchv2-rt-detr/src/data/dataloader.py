@@ -56,6 +56,29 @@ class DataLoader(data.DataLoader):
         self._shuffle = shuffle
 
 
+def _normalize_dct_payload(sample):
+    """Return a `(y_blocks, cbcr_blocks)` tuple regardless of nested layout."""
+    if not isinstance(sample, (tuple, list)) or len(sample) != 2:
+        raise TypeError(
+            "Expected a tuple/list of length 2 representing DCT payload, "
+            f"but received {type(sample).__name__}."
+        )
+
+    y_blocks, chroma = sample
+
+    if not torch.is_tensor(y_blocks):
+        raise TypeError("First element of DCT payload must be a tensor of luminance blocks.")
+
+    if torch.is_tensor(chroma):
+        cbcr_blocks = chroma
+    elif isinstance(chroma, (tuple, list)) and len(chroma) == 2 and all(torch.is_tensor(x) for x in chroma):
+        cbcr_blocks = torch.stack([chroma[0], chroma[1]], dim=0)
+    else:
+        raise TypeError("Second element of DCT payload must be a tensor or tuple of (cb, cr) tensors.")
+
+    return y_blocks, cbcr_blocks
+
+
 @register()
 def batch_image_collate_fn(items):
     """Collate helper that supports tensor images and DCT payloads."""
@@ -70,8 +93,9 @@ def batch_image_collate_fn(items):
         return images, targets
 
     if isinstance(first_sample, (tuple, list)) and len(first_sample) == 2:
-        y_blocks = torch.stack([sample[0][0] for sample in items], dim=0)
-        cbcr_blocks = torch.stack([sample[0][1] for sample in items], dim=0)
+        y_blocks, cbcr_blocks = zip(*[_normalize_dct_payload(sample[0]) for sample in items])
+        y_blocks = torch.stack(list(y_blocks), dim=0)
+        cbcr_blocks = torch.stack(list(cbcr_blocks), dim=0)
         targets = [sample[1] for sample in items]
         return (y_blocks, cbcr_blocks), targets
 
@@ -111,8 +135,9 @@ class BatchImageCollateFuncion(BaseCollateFunction):
         if torch.is_tensor(first_sample):
             images = torch.cat([sample[0][None] for sample in items], dim=0)
         elif isinstance(first_sample, (tuple, list)) and len(first_sample) == 2:
-            y_blocks = torch.stack([sample[0][0] for sample in items], dim=0)
-            cbcr_blocks = torch.stack([sample[0][1] for sample in items], dim=0)
+            y_blocks, cbcr_blocks = zip(*[_normalize_dct_payload(sample[0]) for sample in items])
+            y_blocks = torch.stack(list(y_blocks), dim=0)
+            cbcr_blocks = torch.stack(list(cbcr_blocks), dim=0)
             images = (y_blocks, cbcr_blocks)
         else:
             raise TypeError(

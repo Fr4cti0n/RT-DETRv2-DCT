@@ -97,14 +97,47 @@ class DetSolver(BaseSolver):
 
         start_time = time.time()
         start_epcoch = self.last_epoch + 1
+
+        raw_limit = getattr(args, 'time_limit_seconds', None)
+        if raw_limit is None:
+            yaml_cfg = getattr(args, 'yaml_cfg', None)
+            if isinstance(yaml_cfg, dict):
+                raw_limit = yaml_cfg.get('time_limit_seconds')
+        time_limit_seconds: float | None = None
+        if raw_limit is not None:
+            try:
+                limit_value = float(raw_limit)
+            except (TypeError, ValueError):
+                print(f"[time-limit] Ignoring invalid time limit value on config: {raw_limit}")
+            else:
+                if limit_value > 0:
+                    time_limit_seconds = limit_value
+                    setattr(args, 'time_limit_seconds', time_limit_seconds)
+                    if dist_utils.is_main_process():
+                        minutes = time_limit_seconds / 60.0
+                        print(f"[time-limit] Training will stop after {minutes:.2f} minutes ({int(time_limit_seconds)} seconds).")
+                elif limit_value < 0:
+                    print(f"[time-limit] Ignoring non-positive time limit from config: {limit_value}")
+
+        limit_reached = False
         
         for epoch in range(start_epcoch, args.epoches):
+
+            if time_limit_seconds is not None:
+                elapsed_before_epoch = time.time() - start_time
+                if elapsed_before_epoch >= time_limit_seconds:
+                    if dist_utils.is_main_process():
+                        print(f"[time-limit] Stopping before epoch {epoch}: time budget of {int(time_limit_seconds)} seconds exhausted.")
+                    limit_reached = True
+                    break
 
             self.train_dataloader.set_epoch(epoch)
             # self.train_dataloader.dataset.set_epoch(epoch)
             if dist_utils.is_dist_available_and_initialized():
                 self.train_dataloader.sampler.set_epoch(epoch)
             
+            time_control = {'limit': time_limit_seconds, 'reached': False} if time_limit_seconds is not None else None
+
             train_stats = train_one_epoch(
                 self.model, 
                 self.criterion, 
@@ -117,7 +150,9 @@ class DetSolver(BaseSolver):
                 ema=self.ema, 
                 scaler=self.scaler, 
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
-                writer=self.writer
+                writer=self.writer,
+                time_control=time_control,
+                run_start_time=start_time,
             )
 
             if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
@@ -133,38 +168,48 @@ class DetSolver(BaseSolver):
                 for checkpoint_path in checkpoint_paths:
                     dist_utils.save_on_master(self.state_dict(), checkpoint_path)
 
-            module = self.ema.module if self.ema else self.model
-            test_stats, coco_evaluator = evaluate(
-                module, 
-                self.criterion, 
-                self.postprocessor, 
-                self.val_dataloader, 
-                self.evaluator, 
-                self.device
-            )
+            limit_reached = bool(time_control and time_control.get('reached'))
 
-            # TODO 
-            for k in test_stats:
-                if self.writer and dist_utils.is_main_process():
-                    for i, v in enumerate(test_stats[k]):
-                        self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
-            
-                if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
-                else:
-                    best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
+            test_stats: dict[str, float] = {}
+            coco_evaluator = None
 
-                if best_stat['epoch'] == epoch and self.output_dir:
-                    dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best.pth')
+            if not limit_reached:
+                module = self.ema.module if self.ema else self.model
+                test_stats, coco_evaluator = evaluate(
+                    module, 
+                    self.criterion, 
+                    self.postprocessor, 
+                    self.val_dataloader, 
+                    self.evaluator, 
+                    self.device
+                )
 
-            print(f'best_stat: {best_stat}')
+                for k in test_stats:
+                    if self.writer and dist_utils.is_main_process():
+                        for i, v in enumerate(test_stats[k]):
+                            self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+                    
+                    if k in best_stat:
+                        best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
+                        best_stat[k] = max(best_stat[k], test_stats[k][0])
+                    else:
+                        best_stat['epoch'] = epoch
+                        best_stat[k] = test_stats[k][0]
+
+                    if best_stat['epoch'] == epoch and self.output_dir:
+                        dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best.pth')
+
+                if test_stats:
+                    print(f'best_stat: {best_stat}')
 
             extra_metrics = {"model/n_parameters": float(n_parameters)}
-            self._log_wandb(epoch, train_stats, test_stats, extra=extra_metrics)
+            if time_limit_seconds is not None:
+                extra_metrics["time_limit_seconds"] = float(time_limit_seconds)
+                extra_metrics["time_limit_reached"] = float(limit_reached)
 
-            if best_stat.get('epoch') == epoch:
+            self._log_wandb(epoch, train_stats, test_stats if test_stats else None, extra=extra_metrics)
+
+            if not limit_reached and best_stat.get('epoch') == epoch:
                 self._update_wandb_best(epoch, test_stats)
 
             log_stats = {
@@ -173,6 +218,9 @@ class DetSolver(BaseSolver):
                 'epoch': epoch,
                 'n_parameters': n_parameters
             }
+            if time_limit_seconds is not None:
+                log_stats['time_limit_seconds'] = float(time_limit_seconds)
+                log_stats['time_limit_reached'] = bool(limit_reached)
 
             if self.output_dir and dist_utils.is_main_process():
                 with (self.output_dir / "log.txt").open("a") as f:
@@ -189,12 +237,29 @@ class DetSolver(BaseSolver):
                             torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                     self.output_dir / "eval" / name)
 
+            if limit_reached:
+                if dist_utils.is_main_process():
+                    print(f"[time-limit] Time budget reached ({int(time_limit_seconds)} seconds). Stopping after epoch {epoch}.")
+                break
+
+            if time_limit_seconds is not None:
+                elapsed_after_epoch = time.time() - start_time
+                if elapsed_after_epoch >= time_limit_seconds:
+                    if dist_utils.is_main_process():
+                        print(f"[time-limit] Time budget reached ({int(time_limit_seconds)} seconds). Stopping after epoch {epoch}.")
+                    limit_reached = True
+                    break
+
+        self._finalize_output_dir_with_epoch()
+
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('Training time {}'.format(total_time_str))
         if self.wandb_run is not None and dist_utils.is_main_process():
             self.wandb_run.summary["training/time_seconds"] = total_time
             self.wandb_run.summary["training/epochs_completed"] = self.last_epoch + 1
+            if limit_reached and time_limit_seconds is not None:
+                self.wandb_run.summary["training/time_limit_reached"] = True
         self._finish_wandb()
 
 

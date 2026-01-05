@@ -74,14 +74,23 @@ def _unpack_payload(payload) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Te
     if isinstance(payload, (list, tuple)):
         if len(payload) == 2 and isinstance(payload[0], (list, tuple)) and not torch.is_tensor(payload[0]):
             return _unpack_payload(payload[0])
-        if (
-            len(payload) == 2
-            and torch.is_tensor(payload[0])
-            and isinstance(payload[1], (list, tuple))
-            and len(payload[1]) == 2
-            and all(torch.is_tensor(item) for item in payload[1])
-        ):
-            return payload[0], (payload[1][0], payload[1][1])
+        if len(payload) == 2 and torch.is_tensor(payload[0]):
+            y_blocks = payload[0]
+            chroma = payload[1]
+
+            if isinstance(chroma, (list, tuple)) and len(chroma) == 2 and all(torch.is_tensor(x) for x in chroma):
+                return y_blocks, (chroma[0], chroma[1])
+
+            if torch.is_tensor(chroma):
+                if chroma.dim() >= 2 and chroma.size(1) == 2:
+                    cb_blocks = chroma.select(1, 0)
+                    cr_blocks = chroma.select(1, 1)
+                    return y_blocks, (cb_blocks, cr_blocks)
+                if chroma.dim() >= 1 and chroma.size(0) == 2:
+                    cb_blocks = chroma.select(0, 0)
+                    cr_blocks = chroma.select(0, 1)
+                    return y_blocks, (cb_blocks, cr_blocks)
+
     raise TypeError("Expected (y_blocks, (cb_blocks, cr_blocks)) tuple from CompressToDCT.")
 
 

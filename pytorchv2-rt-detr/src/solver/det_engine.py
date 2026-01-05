@@ -7,6 +7,7 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 
 import sys
 import math
+import time
 from typing import Iterable
 
 import torch
@@ -47,7 +48,28 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     scaler :GradScaler = kwargs.get('scaler', None)
     lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
 
+    time_control = kwargs.get('time_control')
+    run_start_time = kwargs.get('run_start_time')
+    time_limit_seconds = None
+    if isinstance(time_control, dict):
+        time_limit_seconds = time_control.get('limit')
+
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        if (
+            time_limit_seconds is not None
+            and run_start_time is not None
+            and time.time() - run_start_time >= time_limit_seconds
+        ):
+            if isinstance(time_control, dict):
+                time_control['reached'] = True
+            if dist_utils.is_main_process():
+                limit_minutes = time_limit_seconds / 60.0
+                print(
+                    f"[time-limit] Early stop inside epoch {epoch} at step {i}: "
+                    f"budget of {int(time_limit_seconds)} seconds ({limit_minutes:.2f} min) exhausted."
+                )
+            break
+
         samples = _move_to_device(samples, device)
         targets = [{k: _move_to_device(v, device) for k, v in t.items()} for t in targets]
         global_step = epoch * len(data_loader) + i

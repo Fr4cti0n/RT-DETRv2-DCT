@@ -551,6 +551,7 @@ class CompressToDCT(T.Transform):
         return payload, target
 
 
+@register()
 class TrimDCTCoefficients(T.Transform):
     """Reduce DCT payload depth to the requested active coefficients per plane."""
 

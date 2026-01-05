@@ -1,0 +1,76 @@
+__include__: [
+  '../../dataset/coco_detection.yml',
+  '../../runtime.yml',
+  '../include/dataloader.yml',
+  '../include/optimizer.yml',
+  '../include/rtdetrv2_r50vd.yml',
+]
+
+coeff_settings: &coeff_settings
+  coeff_count: 64
+  coeff_count_luma: 16
+  coeff_count_chroma: 48
+  coeff_count_cb: 48
+  coeff_count_cr: 48
+  range_mode: studio
+
+trim_settings: &trim_settings
+  coeff_count_luma: 16
+  coeff_count_chroma: 48
+  coeff_count_cb: 48
+  coeff_count_cr: 48
+
+output_dir: ./output/rtdetrv2_r34vd_lumafusion_coeffY16_Cb48_Cr48_120e_coco
+
+RTDETR:
+  backbone: CompressedPResNet
+
+CompressedPResNet:
+  depth: 34
+  variant: d
+  return_idx: [1, 2, 3]
+  num_stages: 4
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: False
+  compressed_pretrained: null
+  compression_variant: luma-fusion
+  strict_load: False
+  <<: *coeff_settings
+
+HybridEncoder:
+  in_channels: [128, 256, 512]
+  hidden_dim: 256
+  expansion: 0.5
+
+RTDETRTransformerv2:
+  num_layers: 4
+
+epoches: 120
+
+train_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: CompressToDCT, <<: *coeff_settings}
+        - {type: TrimDCTCoefficients, <<: *trim_settings}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+  collate_fn:
+    scales: null
+
+val_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: CompressToDCT, <<: *coeff_settings}
+        - {type: TrimDCTCoefficients, <<: *trim_settings}

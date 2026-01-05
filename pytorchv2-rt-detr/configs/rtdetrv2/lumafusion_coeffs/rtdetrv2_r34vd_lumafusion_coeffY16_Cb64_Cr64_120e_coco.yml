@@ -1,12 +1,26 @@
 __include__: [
-  '../dataset/coco_detection.yml',
-  '../runtime.yml',
-  './include/dataloader.yml',
-  './include/optimizer.yml',
-  './include/rtdetrv2_r50vd.yml',
+  '../../dataset/coco_detection.yml',
+  '../../runtime.yml',
+  '../include/dataloader.yml',
+  '../include/optimizer.yml',
+  '../include/rtdetrv2_r50vd.yml',
 ]
 
-output_dir: ./output/rtdetrv2_r34vd_lumafusion_coeff1_120e_coco
+coeff_settings: &coeff_settings
+  coeff_count: 64
+  coeff_count_luma: 16
+  coeff_count_chroma: 64
+  coeff_count_cb: 64
+  coeff_count_cr: 64
+  range_mode: studio
+
+trim_settings: &trim_settings
+  coeff_count_luma: 16
+  coeff_count_chroma: 64
+  coeff_count_cb: 64
+  coeff_count_cr: 64
+
+output_dir: ./output/rtdetrv2_r34vd_lumafusion_coeffY16_Cb64_Cr64_120e_coco
 
 RTDETR:
   backbone: CompressedPResNet
@@ -21,9 +35,8 @@ CompressedPResNet:
   pretrained: False
   compressed_pretrained: null
   compression_variant: luma-fusion
-  coeff_window: &coeff 1
-  range_mode: studio
   strict_load: False
+  <<: *coeff_settings
 
 HybridEncoder:
   in_channels: [128, 256, 512]
@@ -34,24 +47,6 @@ RTDETRTransformerv2:
   num_layers: 4
 
 epoches: 120
-
-optimizer:
-  type: AdamW
-  params:
-    -
-      params: '^(?=.*backbone)(?!.*norm|bn).*$'
-      lr: 0.00005
-    -
-      params: '^(?=.*backbone)(?=.*norm|bn).*$'
-      lr: 0.00005
-      weight_decay: 0.
-    -
-      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
-      weight_decay: 0.
-
-  lr: 0.0001
-  betas: [0.9, 0.999]
-  weight_decay: 0.0001
 
 train_dataloader:
   dataset:
@@ -65,14 +60,11 @@ train_dataloader:
         - {type: Resize, size: [640, 640]}
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
-        - {type: CompressToDCT, range_mode: studio, coeff_window: *coeff}
+        - {type: CompressToDCT, <<: *coeff_settings}
+        - {type: TrimDCTCoefficients, <<: *trim_settings}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
-      policy:
-        name: stop_epoch
-        epoch: 117
-        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
   collate_fn:
-    scales: ~
+    scales: null
 
 val_dataloader:
   dataset:
@@ -80,4 +72,5 @@ val_dataloader:
       ops:
         - {type: Resize, size: [640, 640]}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
-        - {type: CompressToDCT, range_mode: studio, coeff_window: *coeff}
+        - {type: CompressToDCT, <<: *coeff_settings}
+        - {type: TrimDCTCoefficients, <<: *trim_settings}
