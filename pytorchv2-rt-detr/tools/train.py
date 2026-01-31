@@ -127,13 +127,20 @@ def _find_latest_checkpoint_for_config(config_path: str, output_dir: str | None,
     return best_path
 
 
-def _format_backbone_prefix(variant: str, coeff_luma: int, coeff_cb: int, coeff_cr: int) -> str:
+def _format_backbone_prefix(
+    variant: str,
+    coeff_luma: int,
+    coeff_cb: int,
+    coeff_cr: int,
+    channel_scale: float = 1.0,
+) -> str:
     tag = f"coeffY{coeff_luma}"
     if coeff_cb == coeff_cr:
         tag += f"_CbCr{coeff_cb}"
     else:
         tag += f"_Cb{coeff_cb}_Cr{coeff_cr}"
-    return f"{variant}_{tag}"
+    scale_tag = "" if channel_scale == 1.0 else f"_cs{int(round(channel_scale * 100))}"
+    return f"{variant}_{tag}{scale_tag}"
 
 
 def _pick_best_checkpoint_in_dir(run_dir: Path) -> Path | None:
@@ -201,7 +208,12 @@ def _find_backbone_checkpoint_for_config(cfg: YAMLConfig, backbone_root: str | N
     except (TypeError, ValueError):
         coeff_cr = coeff_cb
 
-    prefix = _format_backbone_prefix(variant, coeff_luma, coeff_cb, coeff_cr)
+    try:
+        channel_scale = float(compressed.get('channel_scale', 1.0))
+    except (TypeError, ValueError):
+        channel_scale = 1.0
+
+    prefix = _format_backbone_prefix(variant, coeff_luma, coeff_cb, coeff_cr, channel_scale)
 
     depth = compressed.get('depth')
     search_dirs: list[Path] = []

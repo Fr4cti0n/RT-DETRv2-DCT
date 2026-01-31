@@ -86,6 +86,49 @@ def _apply_pruned_overrides(cfg: dict) -> dict:
 
     return cfg
 
+
+def _apply_channel_scale_overrides(cfg: dict) -> dict:
+    """Align downstream in_channels with a channel-scaled CompressedPResNet."""
+    compressed = cfg.get('CompressedPResNet')
+    if not isinstance(compressed, dict):
+        return cfg
+
+    try:
+        scale = float(compressed.get('channel_scale', 1.0))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        scale = 1.0
+    if scale == 1.0:
+        return cfg
+
+    try:
+        depth = int(compressed.get('depth', 34))
+    except (TypeError, ValueError):
+        depth = 34
+    try:
+        return_idx = list(compressed.get('return_idx', [1, 2, 3]))
+    except Exception:  # pragma: no cover - defensive
+        return_idx = [1, 2, 3]
+
+    expansion = 4 if depth >= 50 else 1
+
+    def _scale_channels(val: int) -> int:
+        return max(1, int(round(val * scale)))
+
+    base_channels = [64, 128, 256, 512]
+    scaled = [_scale_channels(v) for v in base_channels]
+    out_channels = [v * expansion for v in scaled]
+
+    in_channels: list[int] = []
+    for idx in return_idx:
+        if isinstance(idx, int) and 0 <= idx < len(out_channels):
+            in_channels.append(out_channels[idx])
+
+    if in_channels:
+        encoder_cfg = cfg.setdefault('HybridEncoder', {})
+        encoder_cfg['in_channels'] = in_channels
+
+    return cfg
+
 class YAMLConfig(BaseConfig):
     def __init__(self, cfg_path: str, **kwargs) -> None:
         super().__init__()
@@ -93,6 +136,7 @@ class YAMLConfig(BaseConfig):
         cfg = load_config(cfg_path)
         cfg = merge_dict(cfg, kwargs)
         cfg = _apply_pruned_overrides(cfg)
+        cfg = _apply_channel_scale_overrides(cfg)
 
         self.yaml_cfg = copy.deepcopy(cfg) 
         

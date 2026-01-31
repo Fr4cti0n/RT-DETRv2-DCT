@@ -105,6 +105,37 @@ def _parse_positive_int(value: str) -> int:
     return parsed
 
 
+def _model_size_mb(model: nn.Module) -> tuple[int, float]:
+    """Return parameter count and estimated parameter size in MB (parameters + buffers)."""
+    params = sum(p.numel() for p in model.parameters())
+    buffer_elems = sum(b.numel() for b in model.buffers())
+    total_elems = params + buffer_elems
+    # Use element_size from first parameter/buffer if available, default to 4 bytes.
+    elem_size = None
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if tensor is not None:
+            elem_size = tensor.element_size()
+            break
+    if elem_size is None:
+        elem_size = 4
+    size_mb = (total_elems * elem_size) / (1024 ** 2)
+    return params, size_mb
+
+
+_CHANNEL_SCALE_CHOICES = {1.0, 0.9, 0.8, 0.7, 0.6, 0.5}
+
+
+def _parse_channel_scale(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("channel scale must be a number") from exc
+    if parsed not in _CHANNEL_SCALE_CHOICES:
+        allowed = ", ".join(str(v) for v in sorted(_CHANNEL_SCALE_CHOICES, reverse=True))
+        raise argparse.ArgumentTypeError(f"channel scale must be one of {{{allowed}}}")
+    return parsed
+
+
 def _init_distributed_mode(args: argparse.Namespace) -> None:
     env_has_dist = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     requested_dist = getattr(args, "distributed", False)
@@ -189,6 +220,7 @@ def _load_checkpoint_compression_config(checkpoint_path: Path) -> dict[str, obje
         "coeff_window_cb",
         "coeff_window_cr",
         "trim_coefficients",
+        "channel_scale",
     }
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -237,6 +269,25 @@ def _apply_checkpoint_compression_config(args: argparse.Namespace, config: dict[
                 "proceeding with CLI value."
             )
 
+    def _assign_optional_float(attr: str) -> None:
+        if attr not in config:
+            return
+        value = config[attr]
+        if value is None:
+            return
+        try:
+            stored = float(value)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return
+        current = getattr(args, attr, None)
+        if current is None:
+            setattr(args, attr, stored)
+        elif current != stored:
+            print(
+                f"[resume] Warning: CLI {attr}={current} differs from checkpoint value {stored}; "
+                "proceeding with CLI value."
+            )
+
     def _assign_bool(attr: str) -> None:
         if attr not in config:
             return
@@ -268,15 +319,17 @@ def _apply_checkpoint_compression_config(args: argparse.Namespace, config: dict[
     ):
         _assign_optional_window(attr)
     _assign_bool("trim_coefficients")
+    _assign_optional_float("channel_scale")
 
 
-def _format_run_prefix(variant: str, coeff_luma: int, coeff_cb: int, coeff_cr: int) -> str:
+def _format_run_prefix(variant: str, coeff_luma: int, coeff_cb: int, coeff_cr: int, channel_scale: float = 1.0) -> str:
     window_tag = f"coeffY{coeff_luma}"
     if coeff_cb == coeff_cr:
         window_tag += f"_CbCr{coeff_cb}"
     else:
         window_tag += f"_Cb{coeff_cb}_Cr{coeff_cr}"
-    return f"{variant}_{window_tag}"
+    scale_tag = "" if channel_scale == 1.0 else f"_cs{int(round(channel_scale * 100))}"
+    return f"{variant}_{window_tag}{scale_tag}"
 
 
 def _find_latest_checkpoint(base_dir: Path, run_prefix: str) -> Path | None:
@@ -318,6 +371,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--persistent-workers", action="store_true",
                         help="Enable persistent worker processes for the train/val DataLoaders (requires workers > 0).")
     parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument(
+        "--channel-scale",
+        type=_parse_channel_scale,
+        default=1.0,
+        help="Multiply backbone channels by this factor (options: 0.9, 0.8, 0.7, 0.6, 0.5; default: 1.0).",
+    )
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--eta-min", type=float, default=0.0,
@@ -914,6 +973,7 @@ def main() -> None:
         args.coeff_count_luma,
         args.coeff_count_cb,
         args.coeff_count_cr,
+        args.channel_scale,
     )
 
     if args.resume is not None:
@@ -956,9 +1016,11 @@ def main() -> None:
         args.coeff_count_luma,
         args.coeff_count_cb,
         args.coeff_count_cr,
+        args.channel_scale,
     )
 
     coeff_descriptor = f"coeffY{args.coeff_count_luma}_Cb{args.coeff_count_cb}_Cr{args.coeff_count_cr}"
+    scale_descriptor = f"cs{int(round(args.channel_scale * 100))}"
 
     if args.distributed:
         if args.device is not None and is_main:
@@ -1118,7 +1180,7 @@ def main() -> None:
 
     wandb_run = None
 
-    model, _ = build_model("resnet34", _NUM_CLASSES)
+    model, _ = build_model("resnet34", _NUM_CLASSES, channel_scale=args.channel_scale)
     model.apply(kaiming_initialisation)
     model.backbone = build_compressed_backbone(
         args.variant,
@@ -1142,6 +1204,35 @@ def main() -> None:
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     model.to(device)
+
+    if is_main:
+        baseline_model, _ = build_model("resnet34", _NUM_CLASSES, channel_scale=1.0)
+        baseline_model.apply(kaiming_initialisation)
+        baseline_model.backbone = build_compressed_backbone(
+            args.variant,
+            baseline_model.backbone,
+            range_mode=args.range_mode,
+            mean=_IMAGENET_MEAN,
+            std=_IMAGENET_STD,
+            coeff_window_luma=args.coeff_window_luma,
+            coeff_window_chroma=args.coeff_window_chroma,
+            coeff_window_cb=args.coeff_window_cb,
+            coeff_window_cr=args.coeff_window_cr,
+            coeff_count_luma=args.coeff_count_luma,
+            coeff_count_chroma=args.coeff_count_chroma,
+            coeff_count_cb=args.coeff_count_cb,
+            coeff_count_cr=args.coeff_count_cr,
+        )
+        if args.variant == "luma-fusion-pruned":
+            baseline_hidden = baseline_model.backbone.out_channels[0]
+            baseline_model.head = ClassHead(hidden_dim=baseline_hidden, num_classes=_NUM_CLASSES)
+            baseline_model.head.apply(kaiming_initialisation)
+        baseline_params, baseline_mb = _model_size_mb(baseline_model)
+        param_count, param_size_mb = _model_size_mb(model)
+        print(
+            f"[model] current parameters={param_count:,} (~{param_size_mb:.2f} MB incl. buffers) | "
+            f"baseline (channel_scale=1.0) parameters={baseline_params:,} (~{baseline_mb:.2f} MB incl. buffers)"
+        )
 
     if args.compile_model:
         try:
@@ -1272,6 +1363,8 @@ def main() -> None:
             "coeff_count_cb": args.coeff_count_cb,
             "coeff_count_cr": args.coeff_count_cr,
             "coeff_descriptor": coeff_descriptor,
+            "channel_scale": args.channel_scale,
+            "channel_scale_tag": scale_descriptor,
             "trim_coefficients": args.trim_coefficients,
             "range_mode": args.range_mode,
             "image_size": args.image_size,
@@ -1302,7 +1395,7 @@ def main() -> None:
         }
         default_name = run_subdir_name
         run_name = args.wandb_run_name or default_name
-        auto_tags = [args.variant, coeff_descriptor, f"trim_{'on' if args.trim_coefficients else 'off'}"]
+        auto_tags = [args.variant, coeff_descriptor, scale_descriptor, f"trim_{'on' if args.trim_coefficients else 'off'}"]
         custom_tags = list(args.wandb_tags) if args.wandb_tags is not None else []
         combined_tags: list[str] = []
         for tag in (*auto_tags, *custom_tags):
@@ -1344,6 +1437,7 @@ def main() -> None:
             "coeff_count_chroma": args.coeff_count_chroma,
             "coeff_count_cb": args.coeff_count_cb,
             "coeff_count_cr": args.coeff_count_cr,
+            "channel_scale": args.channel_scale,
             "range_mode": args.range_mode,
             "trim_coefficients": args.trim_coefficients,
             "image_size": args.image_size,
@@ -1619,6 +1713,7 @@ def main() -> None:
                             "coeff_count_chroma": args.coeff_count_chroma,
                             "coeff_count_cb": args.coeff_count_cb,
                             "coeff_count_cr": args.coeff_count_cr,
+                            "channel_scale": args.channel_scale,
                             "trim_coefficients": args.trim_coefficients,
                             "range_mode": args.range_mode,
                             "best_acc": best_acc,
@@ -1645,6 +1740,7 @@ def main() -> None:
                         "coeff_count_chroma": args.coeff_count_chroma,
                         "coeff_count_cb": args.coeff_count_cb,
                         "coeff_count_cr": args.coeff_count_cr,
+                        "channel_scale": args.channel_scale,
                         "trim_coefficients": args.trim_coefficients,
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
@@ -1670,6 +1766,7 @@ def main() -> None:
                         "coeff_count_chroma": args.coeff_count_chroma,
                         "coeff_count_cb": args.coeff_count_cb,
                         "coeff_count_cr": args.coeff_count_cr,
+                        "channel_scale": args.channel_scale,
                         "trim_coefficients": args.trim_coefficients,
                         "range_mode": args.range_mode,
                         "best_acc": best_acc,
@@ -1757,6 +1854,7 @@ def main() -> None:
                     "coeff_count_chroma": args.coeff_count_chroma,
                     "coeff_count_cb": args.coeff_count_cb,
                     "coeff_count_cr": args.coeff_count_cr,
+                    "channel_scale": args.channel_scale,
                     "image_size": args.image_size,
                     "batch_size": bench_bs,
                     "samples": result.samples,
@@ -1790,6 +1888,7 @@ def main() -> None:
             "coeff_count_chroma",
             "coeff_count_cb",
             "coeff_count_cr",
+            "channel_scale",
             "image_size",
             "batch_size",
             "samples",

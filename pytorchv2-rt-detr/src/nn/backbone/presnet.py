@@ -31,6 +31,11 @@ donwload_url = {
 }
 
 
+def _scale_channels(value: int, scale: float) -> int:
+    scaled = int(round(value * scale))
+    return max(1, scaled)
+
+
 class ConvNormLayer(nn.Module):
     def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act=None):
         super().__init__()
@@ -166,16 +171,21 @@ class PResNet(nn.Module):
         act='relu',
         freeze_at=-1, 
         freeze_norm=True, 
-        pretrained=False):
+        pretrained=False,
+        channel_scale: float = 1.0):
         super().__init__()
 
+        if not 0.0 < channel_scale <= 1.0:
+            raise ValueError(f"channel_scale must be within (0, 1]; received {channel_scale}.")
+        self.channel_scale = float(channel_scale)
         block_nums = ResNet_cfg[depth]
-        ch_in = 64
+        ch_in = _scale_channels(64, self.channel_scale)
         if variant in ['c', 'd']:
+            half = max(1, ch_in // 2)
             conv_def = [
-                [3, ch_in // 2, 3, 2, "conv1_1"],
-                [ch_in // 2, ch_in // 2, 3, 1, "conv1_2"],
-                [ch_in // 2, ch_in, 3, 1, "conv1_3"],
+                [3, half, 3, 2, "conv1_1"],
+                [half, half, 3, 1, "conv1_2"],
+                [half, ch_in, 3, 1, "conv1_3"],
             ]
         else:
             conv_def = [[3, ch_in, 7, 2, "conv1_1"]]
@@ -184,11 +194,13 @@ class PResNet(nn.Module):
             (name, ConvNormLayer(cin, cout, k, s, act=act)) for cin, cout, k, s, name in conv_def
         ]))
 
-        ch_out_list = [64, 128, 256, 512]
+        ch_out_list = [_scale_channels(v, self.channel_scale) for v in (64, 128, 256, 512)]
         block = BottleNeck if depth >= 50 else BasicBlock
 
         _out_channels = [block.expansion * v for v in ch_out_list]
         _out_strides = [4, 8, 16, 32]
+
+        ch_in = ch_out_list[0]
 
         self.res_layers = nn.ModuleList()
         for i in range(num_stages):
@@ -210,6 +222,8 @@ class PResNet(nn.Module):
         if freeze_norm:
             self._freeze_norm(self)
 
+        if pretrained and self.channel_scale != 1.0:
+            raise ValueError("Pretrained weights are only available when channel_scale is 1.0.")
         if pretrained:
             if isinstance(pretrained, bool) or 'http' in pretrained:
                 state = torch.hub.load_state_dict_from_url(donwload_url[depth], map_location='cpu')

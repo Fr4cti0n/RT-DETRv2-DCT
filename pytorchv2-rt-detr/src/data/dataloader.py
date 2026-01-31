@@ -13,6 +13,12 @@ from torchvision.transforms.v2 import functional as VF, InterpolationMode
 
 import random
 from functools import partial
+from typing import Any, Optional, Sequence
+
+from .transforms.compress_reference_images import (
+    CompressToDCT,
+    TrimDCTCoefficients,
+)
 
 from ..core import register
 
@@ -122,12 +128,64 @@ class BatchImageCollateFuncion(BaseCollateFunction):
     def __init__(
         self, 
         scales=None, 
-        stop_epoch=None, 
+        stop_epoch=None,
+        *,
+        require_multiple_of: int | None = None,
+        compress_to_dct: dict[str, Any] | None = None,
+        trim_dct: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.scales = scales
         self.stop_epoch = stop_epoch if stop_epoch is not None else 100000000
+        self.require_multiple_of = require_multiple_of
+        self._compress_params = compress_to_dct or None
+        self._trim_params = trim_dct or None
+        self._compress_transform: Optional[CompressToDCT] = None
+        self._trim_transform: Optional[TrimDCTCoefficients] = None
         # self.interpolation = interpolation
+
+        if self.require_multiple_of is not None:
+            divisor = int(self.require_multiple_of)
+            if divisor <= 0:
+                raise ValueError("require_multiple_of must be a positive integer")
+            if self.scales is not None:
+                for scale in self.scales:
+                    if isinstance(scale, Sequence):
+                        dims = list(scale)
+                    else:
+                        dims = [scale]
+                    if any(int(dim) % divisor for dim in dims):
+                        raise ValueError(
+                            f"Scale {scale} is not divisible by {divisor}; "
+                            "update the configuration to use multiples of the compression block size."
+                        )
+
+    def _ensure_transforms(self) -> None:
+        if self._compress_params is not None and self._compress_transform is None:
+            self._compress_transform = CompressToDCT(**self._compress_params)
+        if self._trim_params is not None and self._trim_transform is None:
+            if self._trim_params.get("coeff_count_luma") is None:
+                raise ValueError("trim_dct requires coeff_count_luma to be specified")
+            self._trim_transform = TrimDCTCoefficients(**self._trim_params)
+
+    def _apply_compression(self, images: torch.Tensor, targets: list[dict]) -> tuple[tuple[torch.Tensor, torch.Tensor], list[dict]]:
+        self._ensure_transforms()
+        if self._compress_transform is None:
+            raise RuntimeError("Compression parameters were not provided but compression was requested.")
+
+        payloads = []
+        updated_targets: list[dict] = []
+        for image, target in zip(images, targets, strict=True):
+            payload, tgt = self._compress_transform((image, target))
+            if self._trim_transform is not None:
+                payload, tgt = self._trim_transform((payload, tgt))
+            payloads.append(payload)
+            updated_targets.append(tgt)
+
+        y_blocks, cbcr_blocks = zip(*[_normalize_dct_payload(payload) for payload in payloads])
+        y_tensor = torch.stack(list(y_blocks), dim=0)
+        cbcr_tensor = torch.stack(list(cbcr_blocks), dim=0)
+        return (y_tensor, cbcr_tensor), updated_targets
 
     def __call__(self, items):
         first_sample = items[0][0]
@@ -158,6 +216,11 @@ class BatchImageCollateFuncion(BaseCollateFunction):
 
             sz = random.choice(self.scales)
             images = F.interpolate(images, size=sz)
+            if self.require_multiple_of is not None and (sz % self.require_multiple_of):
+                raise ValueError(
+                    f"Selected scale {sz} is not divisible by {self.require_multiple_of}. "
+                    "Update the configuration to use sizes aligned with the compression block size."
+                )
             if 'masks' in targets[0]:
                 for tg in targets:
                     tg['masks'] = F.interpolate(tg['masks'], size=sz, mode='nearest')
@@ -168,10 +231,22 @@ class BatchImageCollateFuncion(BaseCollateFunction):
             and self.epoch < self.stop_epoch
             and isinstance(images, tuple)
         ):
-            raise NotImplementedError(
-                "Multiscale interpolation is not supported for DCT payloads. "
-                "Set collate_fn.scales to null when training with compressed inputs."
-            )
+
+            if self._compress_params is None:
+                raise NotImplementedError(
+                    "Multiscale interpolation is not supported for pre-compressed payloads. "
+                    "Provide compress_to_dct parameters in the collate_fn configuration "
+                    "to enable compression after resizing."
+                )
+
+        if torch.is_tensor(images) and self._compress_params is not None:
+            if self.require_multiple_of is not None:
+                height, width = images.shape[-2:]
+                if height % self.require_multiple_of or width % self.require_multiple_of:
+                    raise ValueError(
+                        "Image resolution after resizing must be divisible by the compression block size."
+                    )
+            images, targets = self._apply_compression(images, targets)
 
         return images, targets
 

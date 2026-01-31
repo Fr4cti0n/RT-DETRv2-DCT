@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Iterator, NamedTuple
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import torch
 
 
@@ -35,6 +36,56 @@ class RunMetrics(NamedTuple):
     total_coeff: int
     best_acc: float
     epoch: int
+    info_fraction: float | None = None
+
+
+_EXTRA_RUNS: tuple[RunMetrics, ...] = (
+    RunMetrics(
+        run_dir=Path("manual/Y64_CbCr64_block-upsamp"),
+        variant="block-upsamp",
+        coeff_luma=64,
+        coeff_cb=64,
+        coeff_cr=64,
+        total_coeff=64 + 64 + 64,
+        best_acc=0.73253,
+        epoch=0,
+        info_fraction=1.0,
+    ),
+    RunMetrics(
+        run_dir=Path("manual/Y64_CbCr64_rgb-baseline"),
+        variant="rgb-baseline",
+        coeff_luma=64,
+        coeff_cb=64,
+        coeff_cr=64,
+        total_coeff=64 + 64 + 64,
+        best_acc=0.7311,
+        epoch=0,
+        info_fraction=1.0,
+    ),
+)
+
+
+def _format_combo(coeff_luma: int, coeff_cb: int, coeff_cr: int) -> str:
+    if coeff_cb == coeff_cr:
+        return f"Y{coeff_luma}-CbCr{coeff_cb}"
+    return f"Y{coeff_luma}-Cb{coeff_cb}-Cr{coeff_cr}"
+
+
+def _append_extra_runs(metrics: list[RunMetrics]) -> None:
+    metrics.extend(_EXTRA_RUNS)
+
+
+def _compute_info_fraction(entry: RunMetrics) -> float:
+    if entry.info_fraction is not None:
+        return entry.info_fraction
+    coeff_luma = max(entry.coeff_luma, 0)
+    coeff_cb = max(entry.coeff_cb, 0)
+    coeff_cr = max(entry.coeff_cr, 0)
+    return (
+        (coeff_luma / 64.0) * (1.0 / 3.0)
+        + (coeff_cb / 64.0) * (1.0 / 6.0)
+        + (coeff_cr / 64.0) * (1.0 / 6.0)
+    )
 
 
 def _iter_run_directories(root: Path) -> Iterator[Path]:
@@ -100,42 +151,92 @@ def _build_plot(metrics: list[RunMetrics], output_path: Path | None, show: bool)
         print("[info] No runs found; nothing to plot.")
         return
 
+    combos = sorted({(m.coeff_luma, m.coeff_cb, m.coeff_cr) for m in metrics})
     variants = sorted({item.variant for item in metrics})
-    colour_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-    colour_lookup = {variant: colour_cycle[i % len(colour_cycle)] for i, variant in enumerate(variants)}
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.set_title("Accuracy vs. Total Retained Coefficients")
-    ax.set_xlabel("Total retained coefficients (Y + Cb + Cr)")
+    colour_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+    marker_cycle = ["o", "^", "s", "D", "P", "X", "*", "v"]
+
+    colour_lookup = {
+        combo: colour_cycle[i % len(colour_cycle)]
+        for i, combo in enumerate(combos)
+    }
+    marker_lookup = {
+        variant: marker_cycle[i % len(marker_cycle)]
+        for i, variant in enumerate(variants)
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.subplots_adjust(right=0.74)
+    ax.set_title("Accuracy vs. Retained Information Fraction")
+    ax.set_xlabel("Retained information (fraction of original)")
     ax.set_ylabel("Best validation accuracy (top-1)")
 
-    for item in metrics:
-        colour = colour_lookup.get(item.variant, "C0")
-        ax.scatter(item.total_coeff, item.best_acc, color=colour, label=item.variant)
-        combo_label = f"Y{item.coeff_luma}-Cb{item.coeff_cb}-Cr{item.coeff_cr}"
+    for index, item in enumerate(metrics, start=1):
+        combo_key = (item.coeff_luma, item.coeff_cb, item.coeff_cr)
+        colour = colour_lookup.get(combo_key, "C0")
+        marker = marker_lookup.get(item.variant, "o")
+        x_value = _compute_info_fraction(item)
+        ax.scatter(
+            x_value,
+            item.best_acc,
+            color=colour,
+            marker=marker,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+        right_side = index % 2 == 1
+        x_offset = 6 if right_side else -6
+        ha = "left" if right_side else "right"
+        jitter = (index % 3) - 1  # -1, 0, or +1 for slight vertical variety
         ax.annotate(
-            combo_label,
-            (item.total_coeff, item.best_acc),
+            str(index),
+            (x_value, item.best_acc),
             textcoords="offset points",
-            xytext=(5, 5),
-            ha="left",
-            fontsize=8,
+            xytext=(x_offset, 3 + 2 * jitter),
+            ha=ha,
+            fontsize=7,
+            color=colour,
         )
 
-    # Build legend without duplicates by using the colours we assigned.
-    handles = []
-    labels = []
-    for variant in variants:
-        handles.append(ax.scatter([], [], color=colour_lookup.get(variant, "C0")))
-        labels.append(variant)
-    if handles:
-        ax.legend(handles, labels, title="Variant", loc="lower right")
+    legend_handles: list[Line2D] = []
+    legend_labels: list[str] = []
+
+    for index, item in enumerate(metrics, start=1):
+        combo_key = (item.coeff_luma, item.coeff_cb, item.coeff_cr)
+        colour = colour_lookup.get(combo_key, "C0")
+        marker = marker_lookup.get(item.variant, "o")
+        legend_handles.append(
+            Line2D(
+                [],
+                [],
+                linestyle="",
+                marker=marker,
+                color=colour,
+                markeredgecolor="black",
+                markeredgewidth=0.5,
+            )
+        )
+        legend_labels.append(
+            f"{index}: {_format_combo(item.coeff_luma, item.coeff_cb, item.coeff_cr)} ({item.variant})"
+        )
+
+    if legend_handles:
+        legend = ax.legend(
+            legend_handles,
+            legend_labels,
+                title="Colour, number = variants",
+            loc="center left",
+            bbox_to_anchor=(1.0, 0.5),
+            fontsize=8,
+        )
+        ax.add_artist(legend)
 
     ax.grid(True, linestyle="--", alpha=0.3)
 
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
+        fig.tight_layout(rect=(0, 0, 0.74, 1))
         fig.savefig(output_path, dpi=200)
         print(f"[info] Plot written to {output_path}")
 
@@ -146,14 +247,14 @@ def _build_plot(metrics: list[RunMetrics], output_path: Path | None, show: bool)
 
 
 def _print_table(metrics: list[RunMetrics]) -> None:
-    header = f"{'Run Directory':60}  {'Combo':>20}  {'TotalCoeff':>10}  {'BestAcc':>8}"
+    header = f"{'Run Directory':60}  {'Combo':>20}  {'InfoFrac':>8}  {'BestAcc':>8}"
     print(header)
     print("-" * len(header))
     for item in sorted(metrics, key=lambda r: r.best_acc, reverse=True):
-        combo_label = f"Y{item.coeff_luma}-Cb{item.coeff_cb}-Cr{item.coeff_cr}"
+        combo_label = _format_combo(item.coeff_luma, item.coeff_cb, item.coeff_cr)
         print(
             f"{item.run_dir.name:60}  "
-            f"{combo_label:>20}  {item.total_coeff:10d}  {item.best_acc:8.4f}"
+            f"{combo_label:>20}  {_compute_info_fraction(item):8.4f}  {item.best_acc:8.4f}"
         )
 
 
@@ -162,7 +263,7 @@ def main() -> None:
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=Path("src/nn/backbone/crianns_training"),
+        default=Path("output/compressed_resnet34"),
         help="Directory containing run sub-folders (default: %(default)s)",
     )
     parser.add_argument(
@@ -187,6 +288,8 @@ def main() -> None:
         run_metrics = _load_run_metrics(run_dir)
         if run_metrics is not None:
             metrics.append(run_metrics)
+
+    _append_extra_runs(metrics)
 
     _print_table(metrics)
     _build_plot(metrics, args.output_plot, args.show)

@@ -139,14 +139,20 @@ def _move_to_device(obj, device: torch.device):
     return obj
 
 
-def build_model(model_name: str, num_classes: int) -> Tuple[nn.Module, int]:
+def build_model(model_name: str, num_classes: int, *, channel_scale: float = 1.0) -> Tuple[nn.Module, int]:
     model_name = model_name.lower()
     if model_name == "resnet34":
-        backbone = PResNet(depth=34, return_idx=[3], pretrained=False,
-                           freeze_at=-1, freeze_norm=False)
-        head = ClassHead(hidden_dim=512, num_classes=num_classes)
+        backbone = PResNet(
+            depth=34,
+            return_idx=[3],
+            pretrained=False,
+            freeze_at=-1,
+            freeze_norm=False,
+            channel_scale=channel_scale,
+        )
+        head = ClassHead(hidden_dim=backbone.out_channels[0], num_classes=num_classes)
         model = Classification(backbone=backbone, head=head)
-        return model, 512
+        return model, backbone.out_channels[0]
     if model_name == "cspdarknet53":
         backbone = CSPDarkNet(width_multi=1.0, depth_multi=1.0,
                               return_idx=[-1], act="silu")
