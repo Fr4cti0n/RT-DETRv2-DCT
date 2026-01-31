@@ -1,6 +1,6 @@
 # Compressed backbone training
 
-![Backbone validation accuracy vs retained coefficients](../../plots/Resnet34_accuracy.png)
+![Accuracy vs retained information fraction (top-1)](../../plots/Resnet34_accuracy.png)
 
 This folder hosts standalone trainers for ImageNet-style classification backbones, including DCT-compressed variants used by RT-DETRv2.
 
